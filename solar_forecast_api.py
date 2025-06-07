@@ -25,7 +25,6 @@ from sklearn.ensemble import GradientBoostingRegressor
 from apscheduler.schedulers.background import BackgroundScheduler
 
 
-
 # ── configuration ────────────────────────────────────────────────────────────
 LAT, LON   = 52.0, 5.87                      # Arnhem, NL
 SOLAR_ID   = "B42_SOLAR"
@@ -48,13 +47,6 @@ DAILY_LONG  = 16
 _cache: dict[str, object] = {"ts": 0, "payload": None}
 app = Flask(__name__)
 # ── helpers ──────────────────────────────────────────────────────────────────
-def add_sun_flag(df: pd.DataFrame, sunrise_utc: pd.Timestamp, sunset_utc: pd.Timestamp):
-    """
-    Append a `sun_up` (0/1) column to *df* based on sunrise/sunset timestamps.
-    Assumes df.index is tz-aware UTC datetimes.
-    """
-    return df.assign(sun_up=((df.index >= sunrise_utc) & (df.index <= sunset_utc)).astype(int))
-
 def _dt_utc(ts):
     """
     Parse *scalar or array* into tz-aware UTC datetime(s).
@@ -105,25 +97,17 @@ def get_solar_history(days: int = HIST_DAYS) -> pd.DataFrame:
     )
     return df
 
-def flag_sun_up(ts_series: pd.Series, sunrise_s: int, sunset_s: int) -> pd.Series:
-    """Return 0/1 Series telling whether each UTC timestamp (in seconds) is in daylight."""
-    return ((ts_series >= sunrise_s) & (ts_series <= sunset_s)).astype(int)
 # ── weather data ─────────────────────────────────────────────────────────────
-# ── weather data ────────────────────────────────────────────────────────────
 def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    return (30-day historic hourly, 48-h forecast hourly, daily forecast)
-    Every DataFrame contains a `sun_up` 0/1 flag built only
-    from OpenWeather’s sunrise / sunset values.
-    """
+    """return (30 d hist hrly, 48 h fc hrly, 30 d fc daily)"""
     now = dt.datetime.now(timezone.utc)
 
-    # -------- 30-day hourly history -----------------------------------------
-    hist_rows: list[dict] = []
+    # — 30 d HOURLY HISTORY (1 call per day) ---------------------------------
+    hist_rows = []
     for d in range(1, HIST_DAYS + 1):
         day = now - dt.timedelta(days=d)
-        start_ts = int(day.replace(hour=0, minute=0, second=0).timestamp())
-        end_ts   = int(day.replace(hour=23, minute=59, second=59).timestamp())
+        start_ts = int(day.replace(hour=0,  minute=0, second=0, microsecond=0).timestamp())
+        end_ts   = int(day.replace(hour=23, minute=59, second=59, microsecond=0).timestamp())
 
         r = requests.get(
             HIST_URL,
@@ -135,18 +119,13 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             timeout=15,
         )
         r.raise_for_status()
-        j = r.json()
-        sunrise_s = j["city"]["sunrise"]
-        sunset_s  = j["city"]["sunset"]
-
-        for itm in j.get("list", []):
+        for itm in r.json().get("list", []):
             hist_rows.append(
                 dict(
-                    ts       = _dt_utc(itm["dt"]),
-                    temp     = itm["main"]["temp"],
-                    clouds   = itm["clouds"]["all"],
-                    humidity = itm["main"]["humidity"],
-                    sun_up   = 1 if sunrise_s <= itm["dt"] <= sunset_s else 0,
+                    ts=_dt_utc(itm["dt"]),
+                    temp=itm["main"]["temp"],
+                    clouds=itm["clouds"]["all"],
+                    humidity=itm["main"]["humidity"],
                 )
             )
 
@@ -157,47 +136,26 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
           .drop_duplicates()
     )
 
-    # -------- 48-hour HOURLY forecast ---------------------------------------
-    # -------- 48-hour HOURLY forecast ---------------------------------------
+    # — 48 h HOURLY FORECAST --------------------------------------------------
     fc_hr = requests.get(
         HOURLY_FC,
         params=dict(lat=LAT, lon=LON, units="metric", appid=OWM_KEY),
         timeout=15,
     ).json()
 
-    # we will fetch sunrise / sunset from the DAILY forecast instead
-    fc_dl_short = requests.get(
-        DAILY_FC,
-        params=dict(lat=LAT, lon=LON, cnt=3, units="metric", appid=OWM_KEY),
-        timeout=15,
-    ).json()
-
-    # map ISO-date → (sunrise-s, sunset-s)
-    sun_map = {
-        pd.to_datetime(rec["dt"], unit="s", utc=True).date():
-        (rec["sunrise"], rec["sunset"])
-        for rec in fc_dl_short["list"]
-    }
-
     wx_hr = (
-        pd.DataFrame(fc_hr["list"])[:48]
-          .assign(
-              ts       = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True),
-              temp     = lambda d: d["main"].apply(lambda m: m["temp"]),
-              humidity = lambda d: d["main"].apply(lambda m: m["humidity"]),
-              clouds   = lambda d: d["clouds"].apply(lambda c: c["all"]),
-          )
-          .set_index("ts")[["temp", "clouds", "humidity"]]
+    pd.DataFrame(fc_hr["list"])[:48]
+      .assign(
+          ts       = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True),
+          temp     = lambda d: d["main"].apply(lambda m: m["temp"]),
+          humidity = lambda d: d["main"].apply(lambda m: m["humidity"]),
+          clouds   = lambda d: d["clouds"].apply(lambda c: c["all"]),
+      )
+      .set_index("ts")[["temp", "clouds", "humidity"]]
     )
 
-    # daylight flag using sun_map
-    wx_hr["sun_up"] = [
-        1 if sun_map[row_ts.date()][0] <= int(row_ts.timestamp()) <= sun_map[row_ts.date()][1] else 0
-        for row_ts in wx_hr.index
-    ]
 
-
-    # -------- 16-day DAILY forecast (keep sunrise / sunset) -----------------
+    # — 16 d DAILY FORECAST (+pad → 30 d) ------------------------------------
     fc_dl = requests.get(
         DAILY_FC,
         params=dict(lat=LAT, lon=LON, cnt=16, units="metric", appid=OWM_KEY),
@@ -205,45 +163,30 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     ).json()
 
     wx_dl = (
-        pd.DataFrame(fc_dl["list"])
-          .assign(
-              ts       = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True)
-                                   + pd.Timedelta(hours=12),
-              temp     = lambda d: d["temp"].apply(lambda t: t["max"]),
-              clouds   = lambda d: d["clouds"],
-              humidity = lambda d: d["humidity"],
-              sunrise  = lambda d: d["sunrise"],
-              sunset   = lambda d: d["sunset"],
-          )
-          .set_index("ts")[["temp", "clouds", "humidity", "sunrise", "sunset"]]
-          .sort_index()
+    pd.DataFrame(fc_dl["list"])
+      .assign(
+          ts       = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True)
+                              + pd.Timedelta(hours=12),      # ← shift at noon
+          temp     = lambda d: d["temp"].apply(lambda t: t["max"]),
+          clouds   = lambda d: d["clouds"],
+          humidity = lambda d: d["humidity"],
+      )
+      .set_index("ts")[["temp", "clouds", "humidity"]]
+      .sort_index()
     )
 
     return wx_hist, wx_hr, wx_dl
 
-
-# ── model ────────────────────────────────────────────────────────────────────
 # ── model ────────────────────────────────────────────────────────────────────
 def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
-    # keep only hours where net flow ≠ 0
     solar_hr = solar.loc[lambda s: s["kwh"] != 0].reset_index()
     solar_hr["ts_hour"] = solar_hr["ts"].dt.floor("H")
 
-    wx_hist = (
-        wx_hist.reset_index()
-               .assign(ts_hour=lambda d: d["ts"].dt.floor("H"))
-               .groupby("ts_hour")
-               .agg(
-                   temp="mean",
-                   clouds="mean",
-                   humidity="mean",
-                   sun_up="max",        # at least one daylight record → 1
-               )
-               .reset_index()
-    )
+    wx_hist = wx_hist.reset_index().assign(ts_hour=lambda d: d["ts"].dt.floor("H"))
+    wx_hist = wx_hist.groupby("ts_hour").mean(numeric_only=True).reset_index()
 
     merged = solar_hr.merge(wx_hist, on="ts_hour", how="inner").dropna()
-    if len(merged) < 48:
+    if len(merged) < 48:                          # need at least two sunny days
         class ZeroModel:
             def predict(self, X): return np.zeros(len(X))
         return ZeroModel()
@@ -251,22 +194,19 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
     merged["hour"] = merged["ts_hour"].dt.hour
     merged["doy"]  = merged["ts_hour"].dt.dayofyear
 
-    X = merged[["temp", "clouds", "humidity", "hour", "doy", "sun_up"]]
+    X = merged[["temp", "clouds", "humidity", "hour", "doy"]]
     y = merged["kwh"]
 
     return GradientBoostingRegressor(
         n_estimators=400, learning_rate=0.05, max_depth=3, random_state=0
     ).fit(X, y)
 
-
-# ── prediction helpers ───────────────────────────────────────────────────────
 # ── prediction helpers ───────────────────────────────────────────────────────
 def _predict_block(df, model, horizon):
     blk = df.iloc[:horizon].copy()
     blk["hour"] = blk.index.hour
     blk["doy"]  = blk.index.dayofyear
-
-    X = blk[["temp", "clouds", "humidity", "hour", "doy", "sun_up"]].fillna(method="ffill")
+    X = blk[["temp", "clouds", "humidity", "hour", "doy"]].fillna(method="ffill")
 
     try:
         blk["pred_kwh"] = model.predict(X)
@@ -274,27 +214,21 @@ def _predict_block(df, model, horizon):
         blk["pred_kwh"] = 0.0
 
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
-    blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0
+    blk["pred_mwh"] = blk["pred_kwh"] / 1000.0
     return blk[["pred_mwh", "timestamp"]].round(4).to_dict("records")
 
 def make_forecasts(model, wx_hr: pd.DataFrame, wx_dl: pd.DataFrame):
     hourly = _predict_block(wx_hr, model, 24)
 
     def _expand_day(row_ts, row_vals):
-        """Synthetic 24-hour frame for each daily forecast row."""
         base = row_ts.floor("D")
-        sunrise_s = row_vals["sunrise"]
-        sunset_s  = row_vals["sunset"]
-
-        idx = [base + pd.Timedelta(hours=h) for h in range(24)]
         synth = pd.DataFrame(
             {
                 "temp":     row_vals["temp"],
                 "clouds":   row_vals["clouds"],
                 "humidity": row_vals["humidity"],
-                "sun_up":   [1 if sunrise_s <= t.timestamp() <= sunset_s else 0 for t in idx],
             },
-            index=idx,
+            index=[base + pd.Timedelta(hours=h) for h in range(24)],
         )
         return synth
 
