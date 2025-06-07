@@ -25,6 +25,7 @@ from sklearn.ensemble import GradientBoostingRegressor
 from apscheduler.schedulers.background import BackgroundScheduler
 
 
+
 # ── configuration ────────────────────────────────────────────────────────────
 LAT, LON   = 52.0, 5.87                      # Arnhem, NL
 SOLAR_ID   = "B42_SOLAR"
@@ -38,6 +39,15 @@ OWM_KEY   = os.getenv("OWM_KEY", "67d4dbfce7083e9195b41a0f4dafba74")
 HIST_URL  = "https://history.openweathermap.org/data/2.5/history/city"
 HOURLY_FC = "https://pro.openweathermap.org/data/2.5/forecast/hourly"
 DAILY_FC  = "https://api.openweathermap.org/data/2.5/forecast/daily"
+
+from astral import sun, LocationInfo
+
+ARNHEM = LocationInfo("Arnhem", "NL", "Europe/Amsterdam", LAT, LON)
+
+def is_sun_up(timestamp):
+    s = sun.sun(ARNHEM.observer, date=timestamp.date(), tzinfo=ARNHEM.timezone)
+    return int(s["sunrise"] <= timestamp <= s["sunset"])
+
 
 CACHE_TTL   = 1_800            # sec
 HIST_DAYS   = 30
@@ -184,6 +194,8 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
 
     wx_hist = wx_hist.reset_index().assign(ts_hour=lambda d: d["ts"].dt.floor("H"))
     wx_hist = wx_hist.groupby("ts_hour").mean(numeric_only=True).reset_index()
+    df["sun_up"] = df.index.map(is_sun_up)
+
 
     merged = solar_hr.merge(wx_hist, on="ts_hour", how="inner").dropna()
     if len(merged) < 48:                          # need at least two sunny days
@@ -206,7 +218,9 @@ def _predict_block(df, model, horizon):
     blk = df.iloc[:horizon].copy()
     blk["hour"] = blk.index.hour
     blk["doy"]  = blk.index.dayofyear
-    X = blk[["temp", "clouds", "humidity", "hour", "doy"]].fillna(method="ffill")
+    X = blk[["temp", "clouds", "humidity", "hour", "doy", "sun_up"]].fillna(method="ffill")
+    df["sun_up"] = df.index.map(is_sun_up)
+
 
     try:
         blk["pred_kwh"] = model.predict(X)
