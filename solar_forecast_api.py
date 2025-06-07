@@ -126,29 +126,7 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     }
 
     # ------ 48 h HOURLY forecast --------------------------------------------
-    fc_hr = requests.get(
-        HOURLY_FC,
-        params=dict(lat=LAT, lon=LON, units="metric", appid=OWM_KEY),
-        timeout=15,
-    ).json()
-
-    wx_hr = (
-        pd.DataFrame(fc_hr["list"])[:48]
-          .assign(
-              ts        = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True),
-              temp      = lambda d: d["main"].apply(lambda m: m["temp"]),
-              humidity  = lambda d: d["main"].apply(lambda m: m["humidity"]),
-              clouds    = lambda d: d["clouds"].apply(lambda c: c["all"]),
-          )
-          .set_index("ts")[["temp", "humidity", "clouds"]]
-    )
-    wx_hr["cloud_bucket"] = wx_hr["clouds"].apply(_cloud_bucket)
-    wx_hr["sun_up"] = [
-        1 if sun_map[idx.date()][0] <= int(idx.timestamp()) <= sun_map[idx.date()][1] else 0
-        for idx in wx_hr.index
-    ]
-
-    # ------ 30 day historic hourly ------------------------------------------
+        # ---------- 30-day hourly history ---------------------------------------
     hist_rows = []
     for d in range(1, HIST_DAYS + 1):
         day     = now - dt.timedelta(days=d)
@@ -162,10 +140,9 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                         units="metric", appid=OWM_KEY),
             timeout=15,
         )
-        j = r.json()
-        sunrise_s, sunset_s = j["city"]["sunrise"], j["city"]["sunset"]
+        r.raise_for_status()
 
-        for itm in j.get("list", []):
+        for itm in r.json().get("list", []):
             clouds = itm["clouds"]["all"]
             hist_rows.append(
                 dict(
@@ -174,7 +151,7 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                     humidity  = itm["main"]["humidity"],
                     clouds    = clouds,
                     cloud_bucket = _cloud_bucket(clouds),
-                    sun_up    = 1 if sunrise_s <= itm["dt"] <= sunset_s else 0,
+                    sun_up    = 1 if itm["sys"]["pod"] == "d" else 0,
                 )
             )
 
@@ -182,6 +159,28 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                  .set_index("ts")
                  .sort_index()
                  .drop_duplicates())
+
+
+    # ---------- 48-hour HOURLY forecast -------------------------------------
+    fc_hr = requests.get(
+        HOURLY_FC,
+        params=dict(lat=LAT, lon=LON, units="metric", appid=OWM_KEY),
+        timeout=15,
+    ).json()
+
+    wx_hr = (
+        pd.DataFrame(fc_hr["list"])[:48]
+          .assign(
+              ts        = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True),
+              temp      = lambda d: d["main"].apply(lambda m: m["temp"]),
+              humidity  = lambda d: d["main"].apply(lambda m: m["humidity"]),
+              clouds    = lambda d: d["clouds"].apply(lambda c: c["all"]),
+              sun_up    = lambda d: d["sys"].apply(lambda s: 1 if s["pod"] == "d" else 0),
+          )
+          .set_index("ts")[["temp", "humidity", "clouds", "sun_up"]]
+    )
+    wx_hr["cloud_bucket"] = wx_hr["clouds"].apply(_cloud_bucket)
+
 
     # ------ full DAILY forecast (keep sunrise/sunset) ------------------------
     fc_dl = requests.get(
