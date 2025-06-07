@@ -145,6 +145,7 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
           .sort_index()
           .drop_duplicates()
     )
+    wx_hist["sun_up"] = wx_hist.index.map(is_sun_up)
 
     # — 48 h HOURLY FORECAST --------------------------------------------------
     fc_hr = requests.get(
@@ -152,9 +153,6 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         params=dict(lat=LAT, lon=LON, units="metric", appid=OWM_KEY),
         timeout=15,
     ).json()
-
-    sunrise = pd.to_datetime(fc_hr["city"]["sunrise"], unit="s", utc=True)
-    sunset  = pd.to_datetime(fc_hr["city"]["sunset"],  unit="s", utc=True)
 
     wx_hr = (
     pd.DataFrame(fc_hr["list"])[:48]
@@ -166,6 +164,7 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
       )
       .set_index("ts")[["temp", "clouds", "humidity"]]
       .assign(sun_up = lambda df: ((df.index >= sunrise) & (df.index <= sunset)).astype(int))
+      wx_hr["sun_up"] = wx_hr.index.map(is_sun_up)
 
     )
 
@@ -197,19 +196,23 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
     solar_hr = solar.loc[lambda s: s["kwh"] != 0].reset_index()
     solar_hr["ts_hour"] = solar_hr["ts"].dt.floor("H")
 
-    wx_hist = wx_hist.reset_index().assign(ts_hour=lambda d: d["ts"].dt.floor("H"))
-    wx_hist = wx_hist.groupby("ts_hour").mean(numeric_only=True).reset_index()
-    df["sun_up"] = df.index.map(is_sun_up)
-
+    wx_hist = (
+        wx_hist.reset_index()
+               .assign(ts_hour=lambda d: d["ts"].dt.floor("H"))
+               .groupby("ts_hour")
+               .mean(numeric_only=True)
+               .reset_index()
+    )
 
     merged = solar_hr.merge(wx_hist, on="ts_hour", how="inner").dropna()
-    if len(merged) < 48:                          # need at least two sunny days
+    if len(merged) < 48:
         class ZeroModel:
             def predict(self, X): return np.zeros(len(X))
         return ZeroModel()
 
-    merged["hour"] = merged["ts_hour"].dt.hour
-    merged["doy"]  = merged["ts_hour"].dt.dayofyear
+    merged["hour"]  = merged["ts_hour"].dt.hour
+    merged["doy"]   = merged["ts_hour"].dt.dayofyear
+    merged["sun_up"] = merged["ts_hour"].map(is_sun_up)      # <— NEW
 
     X = merged[["temp", "clouds", "humidity", "hour", "doy", "sun_up"]]
     y = merged["kwh"]
@@ -218,14 +221,17 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
         n_estimators=400, learning_rate=0.05, max_depth=3, random_state=0
     ).fit(X, y)
 
-# ── prediction helpers ───────────────────────────────────────────────────────
+
 def _predict_block(df, model, horizon):
     blk = df.iloc[:horizon].copy()
     blk["hour"] = blk.index.hour
     blk["doy"]  = blk.index.dayofyear
-    X = blk[["temp", "clouds", "humidity", "hour", "doy", "sun_up"]].fillna(method="ffill")
-    df["sun_up"] = df.index.map(is_sun_up)
 
+    # add sun_up if missing
+    if "sun_up" not in blk.columns:
+        blk["sun_up"] = blk.index.map(is_sun_up)
+
+    X = blk[["temp", "clouds", "humidity", "hour", "doy", "sun_up"]].fillna(method="ffill")
 
     try:
         blk["pred_kwh"] = model.predict(X)
@@ -233,7 +239,7 @@ def _predict_block(df, model, horizon):
         blk["pred_kwh"] = 0.0
 
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
-    blk["pred_mwh"] = blk["pred_kwh"] / 1000.0
+    blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0
     return blk[["pred_mwh", "timestamp"]].round(4).to_dict("records")
 
 def make_forecasts(model, wx_hr: pd.DataFrame, wx_dl: pd.DataFrame):
@@ -246,6 +252,7 @@ def make_forecasts(model, wx_hr: pd.DataFrame, wx_dl: pd.DataFrame):
                 "temp":     row_vals["temp"],
                 "clouds":   row_vals["clouds"],
                 "humidity": row_vals["humidity"],
+                "sun_up":   [is_sun_up(t) for t in idx],
             },
             index=[base + pd.Timedelta(hours=h) for h in range(24)],
         )
