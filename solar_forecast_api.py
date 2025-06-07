@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+More actions
 """
 solar_forecast_api.py
 ─────────────────────
@@ -97,73 +97,46 @@ def get_solar_history(days: int = HIST_DAYS) -> pd.DataFrame:
     )
     return df
 
-# ── weather data ────────────────────────────────────────────────────────────
-def _cloud_bucket(pct: float) -> int:
-    """0 = clear (<20%), 1 = partly (20-50), 2 = broken (50-80), 3 = overcast (>=80)."""
-    if pct < 20: return 0
-    if pct < 50: return 1
-    if pct < 80: return 2
-    return 3
-
+# ── weather data ─────────────────────────────────────────────────────────────
 def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Returns (wx_hist, wx_hr, wx_dl) with columns:
-        temp, humidity, clouds, cloud_bucket, sun_up
-    """
+    """return (30 d hist hrly, 48 h fc hrly, 30 d fc daily)"""
     now = dt.datetime.now(timezone.utc)
 
-    # ------ DAILY forecast (sunrise / sunset for next 2 days) ---------------
-    fc_dl_short = requests.get(
-        DAILY_FC,
-        params=dict(lat=LAT, lon=LON, cnt=3, units="metric", appid=OWM_KEY),
-        timeout=15,
-    ).json()
-
-    sun_map = {
-        pd.to_datetime(rec["dt"], unit="s", utc=True).date():
-        (rec["sunrise"], rec["sunset"])
-        for rec in fc_dl_short["list"]
-    }
-
-        # ---------- 30-day hourly history ---------------------------------------
+    # — 30 d HOURLY HISTORY (1 call per day) ---------------------------------
     hist_rows = []
     for d in range(1, HIST_DAYS + 1):
-        day     = now - dt.timedelta(days=d)
-        start_s = int(day.replace(hour=0, minute=0, second=0).timestamp())
-        end_s   = int(day.replace(hour=23, minute=59, second=59).timestamp())
+        day = now - dt.timedelta(days=d)
+        start_ts = int(day.replace(hour=0,  minute=0, second=0, microsecond=0).timestamp())
+        end_ts   = int(day.replace(hour=23, minute=59, second=59, microsecond=0).timestamp())
 
         r = requests.get(
             HIST_URL,
-            params=dict(lat=LAT, lon=LON, type="hour",
-                        start=start_s, end=end_s,
-                        units="metric", appid=OWM_KEY),
+            params=dict(
+                lat=LAT, lon=LON, type="hour",
+                start=start_ts, end=end_ts,
+                units="metric", appid=OWM_KEY,
+            ),
             timeout=15,
         )
         r.raise_for_status()
-        j = r.json()
-
-    for itm in j.get("list", []):
-        clouds = itm["clouds"]["all"]
-        sun_up = 1 if itm["weather"][0]["icon"].endswith("d") else 0   # ← change
-        hist_rows.append(
-            dict(
-                ts        = _dt_utc(itm["dt"]),
-                temp      = itm["main"]["temp"],
-                humidity  = itm["main"]["humidity"],
-                clouds    = clouds,
-                cloud_bucket = _cloud_bucket(clouds),
-                sun_up    = sun_up,
+        for itm in r.json().get("list", []):
+            hist_rows.append(
+                dict(
+                    ts=_dt_utc(itm["dt"]),
+                    temp=itm["main"]["temp"],
+                    clouds=itm["clouds"]["all"],
+                    humidity=itm["main"]["humidity"],
+                )
             )
-        )
 
-    wx_hist = (pd.DataFrame(hist_rows)
-                 .set_index("ts")
-                 .sort_index()
-                 .drop_duplicates())
+    wx_hist = (
+        pd.DataFrame(hist_rows)
+          .set_index("ts")
+          .sort_index()
+          .drop_duplicates()
+    )
 
-
-    # ---------- 48-hour HOURLY forecast -------------------------------------
-       # ---------- 48-hour HOURLY forecast -------------------------------------
+    # — 48 h HOURLY FORECAST --------------------------------------------------
     fc_hr = requests.get(
         HOURLY_FC,
         params=dict(lat=LAT, lon=LON, units="metric", appid=OWM_KEY),
@@ -171,67 +144,49 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     ).json()
 
     wx_hr = (
-        pd.DataFrame(fc_hr["list"])[:48]
-        .assign(
-            ts        = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True),
-            temp      = lambda d: d["main"].apply(lambda m: m["temp"]),
-            humidity  = lambda d: d["main"].apply(lambda m: m["humidity"]),
-            clouds    = lambda d: d["clouds"].apply(lambda c: c["all"]),
-            sun_up    = lambda d: d["weather"].apply(
-                lambda w: 1 if w[0]["icon"].endswith("d") else 0
-            ),
-        )
-        .set_index("ts")[["temp", "humidity", "clouds", "sun_up"]]
+    pd.DataFrame(fc_hr["list"])[:48]
+      .assign(
+          ts       = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True),
+          temp     = lambda d: d["main"].apply(lambda m: m["temp"]),
+          humidity = lambda d: d["main"].apply(lambda m: m["humidity"]),
+          clouds   = lambda d: d["clouds"].apply(lambda c: c["all"]),
+      )
+      .set_index("ts")[["temp", "clouds", "humidity"]]
     )
-    wx_hr["cloud_bucket"] = wx_hr["clouds"].apply(_cloud_bucket)
 
 
-
-    # ------ full DAILY forecast (keep sunrise/sunset) ------------------------
+    # — 16 d DAILY FORECAST (+pad → 30 d) ------------------------------------
     fc_dl = requests.get(
         DAILY_FC,
         params=dict(lat=LAT, lon=LON, cnt=16, units="metric", appid=OWM_KEY),
         timeout=15,
     ).json()
 
-    wx_dl = (pd.DataFrame(fc_dl["list"])
-               .assign(
-                   ts      = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True)
-                                     + pd.Timedelta(hours=12),
-                   temp    = lambda d: d["temp"].apply(lambda t: t["max"]),
-                   clouds  = lambda d: d["clouds"],
-                   humidity= lambda d: d["humidity"],
-               )
-               .set_index("ts")[["temp", "clouds", "humidity", "sunrise", "sunset"]]
-               .sort_index())
+    wx_dl = (
+    pd.DataFrame(fc_dl["list"])
+      .assign(
+          ts       = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True)
+                              + pd.Timedelta(hours=12),      # ← shift at noon
+          temp     = lambda d: d["temp"].apply(lambda t: t["max"]),
+          clouds   = lambda d: d["clouds"],
+          humidity = lambda d: d["humidity"],
+      )
+      .set_index("ts")[["temp", "clouds", "humidity"]]
+      .sort_index()
+    )
 
     return wx_hist, wx_hr, wx_dl
 
-
 # ── model ────────────────────────────────────────────────────────────────────
-# ── model ───────────────────────────────────────────────────────────────────
 def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
-    # keep only hours with non-zero net kWh
     solar_hr = solar.loc[lambda s: s["kwh"] != 0].reset_index()
     solar_hr["ts_hour"] = solar_hr["ts"].dt.floor("H")
 
-    # ↓  every column now has an explicit aggregation func  ↓
-    wx_hist_agg = (
-        wx_hist.reset_index()
-               .assign(ts_hour=lambda d: d["ts"].dt.floor("H"))
-               .groupby("ts_hour")
-               .agg(
-                   temp         = ("temp", "mean"),
-                   humidity     = ("humidity", "mean"),
-                   clouds       = ("clouds",  "mean"),
-                   cloud_bucket = ("cloud_bucket", "max"),
-                   sun_up       = ("sun_up", "max"),
-               )
-               .reset_index()
-    )
+    wx_hist = wx_hist.reset_index().assign(ts_hour=lambda d: d["ts"].dt.floor("H"))
+    wx_hist = wx_hist.groupby("ts_hour").mean(numeric_only=True).reset_index()
 
-    merged = solar_hr.merge(wx_hist_agg, on="ts_hour", how="inner").dropna()
-    if len(merged) < 12:                      # need at least two sunny days
+    merged = solar_hr.merge(wx_hist, on="ts_hour", how="inner").dropna()
+    if len(merged) < 48:                          # need at least two sunny days
         class ZeroModel:
             def predict(self, X): return np.zeros(len(X))
         return ZeroModel()
@@ -239,26 +194,19 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
     merged["hour"] = merged["ts_hour"].dt.hour
     merged["doy"]  = merged["ts_hour"].dt.dayofyear
 
-    X = merged[["temp", "humidity", "clouds",
-                "cloud_bucket", "hour", "doy", "sun_up"]]
+    X = merged[["temp", "clouds", "humidity", "hour", "doy"]]
     y = merged["kwh"]
 
     return GradientBoostingRegressor(
-        n_estimators=400,
-        learning_rate=0.05,
-        max_depth=3,
-        random_state=0,
+        n_estimators=400, learning_rate=0.05, max_depth=3, random_state=0
     ).fit(X, y)
 
-
-# ── prediction helpers ───────────────────────────────────────────────────────
 # ── prediction helpers ───────────────────────────────────────────────────────
 def _predict_block(df, model, horizon):
     blk = df.iloc[:horizon].copy()
     blk["hour"] = blk.index.hour
     blk["doy"]  = blk.index.dayofyear
-    X = blk[["temp", "humidity", "clouds", "cloud_bucket",
-             "hour", "doy", "sun_up"]].fillna(method="ffill")
+    X = blk[["temp", "clouds", "humidity", "hour", "doy"]].fillna(method="ffill")
 
     try:
         blk["pred_kwh"] = model.predict(X)
@@ -266,60 +214,38 @@ def _predict_block(df, model, horizon):
         blk["pred_kwh"] = 0.0
 
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
-    blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0
+    blk["pred_mwh"] = blk["pred_kwh"] / 1000.0
     return blk[["pred_mwh", "timestamp"]].round(4).to_dict("records")
 
-
-def make_forecasts(model: GradientBoostingRegressor,
-                   wx_hr: pd.DataFrame,
-                   wx_dl: pd.DataFrame) -> tuple[list, list]:
-    """Return (24-h hourly list, 7-day daily list)."""
-
-    # ----- helper: build synthetic 24-h frame for each daily row -------------
-    def _expand_day(row_ts: pd.Timestamp, row_vals: pd.Series) -> pd.DataFrame:
-        base       = row_ts.floor("D")
-        sunrise_s  = row_vals["sunrise"]
-        sunset_s   = row_vals["sunset"]
-        clouds_pct = row_vals["clouds"]
-        temp_val   = row_vals["temp"]
-        hum_val    = row_vals["humidity"]
-
-        hours = [base + pd.Timedelta(hours=h) for h in range(24)]
-        return pd.DataFrame(
-            {
-                "temp":     temp_val,
-                "humidity": hum_val,
-                "clouds":   clouds_pct,
-                "cloud_bucket": _cloud_bucket(clouds_pct),
-                "sun_up": [
-                    1 if sunrise_s <= t.timestamp() <= sunset_s else 0
-                    for t in hours
-                ],
-            },
-            index=hours,
-        )
-
-    # ---------------- hourly forecast (next 24 h) ---------------------------
+def make_forecasts(model, wx_hr: pd.DataFrame, wx_dl: pd.DataFrame):
     hourly = _predict_block(wx_hr, model, 24)
 
-    # ---------------- daily forecast (0-6 days) -----------------------------
-    daily_records = []
+    def _expand_day(row_ts, row_vals):
+        base = row_ts.floor("D")
+        synth = pd.DataFrame(
+            {
+                "temp":     row_vals["temp"],
+                "clouds":   row_vals["clouds"],
+                "humidity": row_vals["humidity"],
+            },
+            index=[base + pd.Timedelta(hours=h) for h in range(24)],
+        )
+        return synth
 
-    # day-0 total = sum of the 24 hourly preds we just made
-    day0_ts  = pd.to_datetime(hourly[0]["timestamp"], unit="s", utc=True).floor("D")
+    daily_records = []
+    day0_ts = pd.to_datetime(hourly[0]["timestamp"], unit="s", utc=True).floor("D")
     day0_val = round(sum(pt["pred_mwh"] for pt in hourly), 4)
     daily_records.append({"pred_mwh": day0_val, "timestamp": int(day0_ts.timestamp())})
 
-    for ts, row in wx_dl.iloc[1:8].iterrows():        # next 7 calendar days
+    for ts, row in wx_dl.iloc[1:8].iterrows():  # Only 7 days instead of 16
         synth_df = _expand_day(ts, row)
-        block     = _predict_block(synth_df, model, 24)
-        day_val   = round(sum(pt["pred_mwh"] for pt in block), 4)
+        block = _predict_block(synth_df, model, 24)
+        day_val = round(sum(pt["pred_mwh"] for pt in block), 4)
         daily_records.append(
             {"pred_mwh": day_val, "timestamp": int(ts.floor("D").timestamp())}
         )
 
-    return hourly, daily_records
-
+    return hourly, daily_records  # ← Only return these
 
 
 
