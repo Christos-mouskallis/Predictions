@@ -1,4 +1,4 @@
-More actions
+
 """
 solar_forecast_api.py
 ─────────────────────
