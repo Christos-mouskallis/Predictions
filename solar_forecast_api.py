@@ -209,26 +209,29 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
 
 # ── model ────────────────────────────────────────────────────────────────────
+# ── model ───────────────────────────────────────────────────────────────────
 def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
+    # keep only hours with non-zero net kWh
     solar_hr = solar.loc[lambda s: s["kwh"] != 0].reset_index()
     solar_hr["ts_hour"] = solar_hr["ts"].dt.floor("H")
 
-    wx_hist = (
+    # ↓  every column now has an explicit aggregation func  ↓
+    wx_hist_agg = (
         wx_hist.reset_index()
                .assign(ts_hour=lambda d: d["ts"].dt.floor("H"))
                .groupby("ts_hour")
                .agg(
-                   temp="mean",
-                   humidity="mean",
-                   clouds="mean",
-                   cloud_bucket="max",
-                   sun_up="max",
+                   temp         = ("temp", "mean"),
+                   humidity     = ("humidity", "mean"),
+                   clouds       = ("clouds",  "mean"),
+                   cloud_bucket = ("cloud_bucket", "max"),
+                   sun_up       = ("sun_up", "max"),
                )
                .reset_index()
     )
 
-    merged = solar_hr.merge(wx_hist, on="ts_hour", how="inner").dropna()
-    if len(merged) < 48:
+    merged = solar_hr.merge(wx_hist_agg, on="ts_hour", how="inner").dropna()
+    if len(merged) < 48:                      # need at least two sunny days
         class ZeroModel:
             def predict(self, X): return np.zeros(len(X))
         return ZeroModel()
@@ -236,11 +239,15 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
     merged["hour"] = merged["ts_hour"].dt.hour
     merged["doy"]  = merged["ts_hour"].dt.dayofyear
 
-    X = merged[["temp", "humidity", "clouds", "cloud_bucket", "hour", "doy", "sun_up"]]
+    X = merged[["temp", "humidity", "clouds",
+                "cloud_bucket", "hour", "doy", "sun_up"]]
     y = merged["kwh"]
 
     return GradientBoostingRegressor(
-        n_estimators=400, learning_rate=0.05, max_depth=3, random_state=0
+        n_estimators=400,
+        learning_rate=0.05,
+        max_depth=3,
+        random_state=0,
     ).fit(X, y)
 
 
