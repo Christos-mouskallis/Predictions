@@ -125,7 +125,6 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         for rec in fc_dl_short["list"]
     }
 
-    # ------ 48 h HOURLY forecast --------------------------------------------
         # ---------- 30-day hourly history ---------------------------------------
     hist_rows = []
     for d in range(1, HIST_DAYS + 1):
@@ -142,18 +141,19 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         )
         r.raise_for_status()
 
-        for itm in r.json().get("list", []):
-            clouds = itm["clouds"]["all"]
-            hist_rows.append(
-                dict(
-                    ts        = _dt_utc(itm["dt"]),
-                    temp      = itm["main"]["temp"],
-                    humidity  = itm["main"]["humidity"],
-                    clouds    = clouds,
-                    cloud_bucket = _cloud_bucket(clouds),
-                    sun_up    = 1 if itm["sys"]["pod"] == "d" else 0,
-                )
+    for itm in j.get("list", []):
+        clouds = itm["clouds"]["all"]
+        sun_up = 1 if itm["weather"][0]["icon"].endswith("d") else 0   # ← change
+        hist_rows.append(
+            dict(
+                ts        = _dt_utc(itm["dt"]),
+                temp      = itm["main"]["temp"],
+                humidity  = itm["main"]["humidity"],
+                clouds    = clouds,
+                cloud_bucket = _cloud_bucket(clouds),
+                sun_up    = sun_up,
             )
+        )
 
     wx_hist = (pd.DataFrame(hist_rows)
                  .set_index("ts")
@@ -168,18 +168,21 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         timeout=15,
     ).json()
 
-    wx_hr = (
-        pd.DataFrame(fc_hr["list"])[:48]
-          .assign(
-              ts        = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True),
-              temp      = lambda d: d["main"].apply(lambda m: m["temp"]),
-              humidity  = lambda d: d["main"].apply(lambda m: m["humidity"]),
-              clouds    = lambda d: d["clouds"].apply(lambda c: c["all"]),
-              sun_up    = lambda d: d["sys"].apply(lambda s: 1 if s["pod"] == "d" else 0),
-          )
-          .set_index("ts")[["temp", "humidity", "clouds", "sun_up"]]
-    )
-    wx_hr["cloud_bucket"] = wx_hr["clouds"].apply(_cloud_bucket)
+   wx_hr = (
+    pd.DataFrame(fc_hr["list"])[:48]
+      .assign(
+          ts        = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True),
+          temp      = lambda d: d["main"].apply(lambda m: m["temp"]),
+          humidity  = lambda d: d["main"].apply(lambda m: m["humidity"]),
+          clouds    = lambda d: d["clouds"].apply(lambda c: c["all"]),
+          sun_up    = lambda d: d["weather"].apply(
+                            lambda w: 1 if w[0]["icon"].endswith("d") else 0
+                      ),
+      )
+      .set_index("ts")[["temp", "humidity", "clouds", "sun_up"]]
+)
+wx_hr["cloud_bucket"] = wx_hr["clouds"].apply(_cloud_bucket)
+
 
 
     # ------ full DAILY forecast (keep sunrise/sunset) ------------------------
