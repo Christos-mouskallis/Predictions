@@ -158,14 +158,26 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     )
 
     # -------- 48-hour HOURLY forecast ---------------------------------------
+    # -------- 48-hour HOURLY forecast ---------------------------------------
     fc_hr = requests.get(
         HOURLY_FC,
         params=dict(lat=LAT, lon=LON, units="metric", appid=OWM_KEY),
         timeout=15,
     ).json()
 
-    sunrise = fc_hr["city"]["sunrise"]   # already UTC seconds
-    sunset  = fc_hr["city"]["sunset"]
+    # we will fetch sunrise / sunset from the DAILY forecast instead
+    fc_dl_short = requests.get(
+        DAILY_FC,
+        params=dict(lat=LAT, lon=LON, cnt=3, units="metric", appid=OWM_KEY),
+        timeout=15,
+    ).json()
+
+    # map ISO-date → (sunrise-s, sunset-s)
+    sun_map = {
+        pd.to_datetime(rec["dt"], unit="s", utc=True).date():
+        (rec["sunrise"], rec["sunset"])
+        for rec in fc_dl_short["list"]
+    }
 
     wx_hr = (
         pd.DataFrame(fc_hr["list"])[:48]
@@ -174,10 +186,16 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
               temp     = lambda d: d["main"].apply(lambda m: m["temp"]),
               humidity = lambda d: d["main"].apply(lambda m: m["humidity"]),
               clouds   = lambda d: d["clouds"].apply(lambda c: c["all"]),
-              sun_up   = lambda d: flag_sun_up(d["dt"], sunrise, sunset),
           )
-          .set_index("ts")[["temp", "clouds", "humidity", "sun_up"]]
+          .set_index("ts")[["temp", "clouds", "humidity"]]
     )
+
+    # daylight flag using sun_map
+    wx_hr["sun_up"] = [
+        1 if sun_map[row_ts.date()][0] <= int(row_ts.timestamp()) <= sun_map[row_ts.date()][1] else 0
+        for row_ts in wx_hr.index
+    ]
+
 
     # -------- 16-day DAILY forecast (keep sunrise / sunset) -----------------
     fc_dl = requests.get(
