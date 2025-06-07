@@ -153,6 +153,9 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         timeout=15,
     ).json()
 
+    sunrise = pd.to_datetime(fc_hr["city"]["sunrise"], unit="s", utc=True)
+    sunset  = pd.to_datetime(fc_hr["city"]["sunset"],  unit="s", utc=True)
+
     wx_hr = (
     pd.DataFrame(fc_hr["list"])[:48]
       .assign(
@@ -162,6 +165,8 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
           clouds   = lambda d: d["clouds"].apply(lambda c: c["all"]),
       )
       .set_index("ts")[["temp", "clouds", "humidity"]]
+      .assign(sun_up = lambda df: ((df.index >= sunrise) & (df.index <= sunset)).astype(int))
+
     )
 
 
@@ -206,7 +211,7 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
     merged["hour"] = merged["ts_hour"].dt.hour
     merged["doy"]  = merged["ts_hour"].dt.dayofyear
 
-    X = merged[["temp", "clouds", "humidity", "hour", "doy"]]
+    X = merged[["temp", "clouds", "humidity", "hour", "doy", "sun_up"]]
     y = merged["kwh"]
 
     return GradientBoostingRegressor(
