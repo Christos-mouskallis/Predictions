@@ -162,26 +162,27 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
 
     # ---------- 48-hour HOURLY forecast -------------------------------------
+       # ---------- 48-hour HOURLY forecast -------------------------------------
     fc_hr = requests.get(
         HOURLY_FC,
         params=dict(lat=LAT, lon=LON, units="metric", appid=OWM_KEY),
         timeout=15,
     ).json()
 
-   wx_hr = (
-    pd.DataFrame(fc_hr["list"])[:48]
-      .assign(
-          ts        = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True),
-          temp      = lambda d: d["main"].apply(lambda m: m["temp"]),
-          humidity  = lambda d: d["main"].apply(lambda m: m["humidity"]),
-          clouds    = lambda d: d["clouds"].apply(lambda c: c["all"]),
-          sun_up    = lambda d: d["weather"].apply(
-                            lambda w: 1 if w[0]["icon"].endswith("d") else 0
-                      ),
-      )
-      .set_index("ts")[["temp", "humidity", "clouds", "sun_up"]]
-)
-wx_hr["cloud_bucket"] = wx_hr["clouds"].apply(_cloud_bucket)
+    wx_hr = (
+        pd.DataFrame(fc_hr["list"])[:48]
+        .assign(
+            ts        = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True),
+            temp      = lambda d: d["main"].apply(lambda m: m["temp"]),
+            humidity  = lambda d: d["main"].apply(lambda m: m["humidity"]),
+            clouds    = lambda d: d["clouds"].apply(lambda c: c["all"]),
+            sun_up    = lambda d: d["weather"].apply(
+                lambda w: 1 if w[0]["icon"].endswith("d") else 0
+            ),
+        )
+        .set_index("ts")[["temp", "humidity", "clouds", "sun_up"]]
+    )
+    wx_hr["cloud_bucket"] = wx_hr["clouds"].apply(_cloud_bucket)
 
 
 
