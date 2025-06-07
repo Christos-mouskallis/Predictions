@@ -140,6 +140,7 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             timeout=15,
         )
         r.raise_for_status()
+        j = r.json()
 
     for itm in j.get("list", []):
         clouds = itm["clouds"]["all"]
