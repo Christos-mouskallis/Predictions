@@ -210,14 +210,11 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     return wx_hist, wx_hr, wx_dl
 
 
-# ── model ────────────────────────────────────────────────────────────────────
-# ── model ────────────────────────────────────────────────────────────────────
 from sklearn.linear_model import HuberRegressor
 from numpy import log1p, expm1, clip, zeros
 
 def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
-    """Fit log-capacity-factor model. Always returns an object with .predict(df)."""
-    # ── join solar + weather ────────────────────────────────────────────────
+    """Fit robust model; always returns object with .predict(df) and .calib."""
     solar_hr = solar[solar["kwh"] != 0].reset_index()
     solar_hr["ts_hour"] = solar_hr["ts"].dt.floor("h")
 
@@ -237,66 +234,55 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
 
     merged = solar_hr.merge(wx_hist_agg, on="ts_hour", how="inner").dropna()
     if merged.empty:
-        class ZeroModel:                   # rare: no overlap
-            def predict(self, X): return zeros(len(X))
-        return ZeroModel()
-
-    merged["hour"] = merged["ts_hour"].dt.hour
-    merged["doy"]  = merged["ts_hour"].dt.dayofyear
-    merged["irrad"] = _safe_irrad(merged["clouds"])
-    # …
-    daylight["irrad"] = _safe_irrad(daylight["clouds"])
-
-
-    # ── daylight subset ------------------------------------------------------
-    daylight = merged[merged["sun_up"] == 1].copy()
-    if daylight.empty:                     # all-night data set
         class ZeroModel:
+            def __init__(self): self.calib = 1.0
             def predict(self, X): return zeros(len(X))
         return ZeroModel()
 
-    daylight["cf"] = (daylight["kwh"].abs() /
-                      daylight["irrad"].clip(lower=0.1))
+    merged["hour"]  = merged["ts_hour"].dt.hour
+    merged["doy"]   = merged["ts_hour"].dt.dayofyear
+    merged["irrad"] = 1.0 - merged["clouds"].clip(0, 100) / 100.0
 
+    daylight = merged[merged["sun_up"] == 1].copy()
+    if daylight.empty:
+        class ZeroModel:
+            def __init__(self): self.calib = 1.0
+            def predict(self, X): return zeros(len(X))
+        return ZeroModel()
+
+    # ------- fit log-capacity-factor model ----------------------------------
+    daylight["cf"] = daylight["kwh"].abs() / daylight["irrad"].clip(lower=0.1)
     y = log1p(daylight["cf"])
     X = daylight[["temp", "humidity", "clouds",
                   "cloud_bucket", "hour", "doy"]]
 
     huber = HuberRegressor(max_iter=400, epsilon=1.5).fit(X, y)
-        # --- calibration: best real vs best fitted day -------------------------
-# --- calibration: best real vs best fitted day -------------------------
-    best_real = merged.groupby("ts_hour")["kwh"].sum().abs().max()
-    
-    y_hat = huber.predict(X)                      # len = daylight rows
-    best_pred = (
-        pd.Series(y_hat, index=daylight["ts_hour"])  # ← use daylight index
-          .groupby(daylight["ts_hour"])
-          .sum()
-          .abs()
-          .max()
+
+    # ------- calibration factor ---------------------------------------------
+    best_real  = merged.groupby("ts_hour")["kwh"].sum().abs().max()
+    y_hat      = huber.predict(X)
+    best_pred  = (
+        pd.Series(y_hat, index=daylight["ts_hour"])
+          .groupby(daylight["ts_hour"]).sum().abs().max()
     )
     calib = 1.0 if best_pred == 0 else best_real / best_pred
 
-
-    # ── simple wrapper to rebuild kWh ---------------------------------------
+    # ------- wrapper ---------------------------------------------------------
     class Wrapper:
         def __init__(self, core, calibration):
             self.core  = core
             self.calib = calibration
         def predict(self, X_df):
-            irrad = _safe_irrad(X_df["clouds"])
+            irrad = 1.0 - X_df["clouds"].clip(0, 100) / 100.0
             y_hat = expm1(self.core.predict(
-                          X_df[["temp","humidity","clouds",
-                                "cloud_bucket","hour","doy"]]))
-            y_hat = np.clip(y_hat, 0, np.nanmax(y_hat))        # remove inf
+                    X_df[["temp","humidity","clouds",
+                          "cloud_bucket","hour","doy"]]))
             pred  = -y_hat * irrad
-            pred[~np.isfinite(pred)] = 0.0                     # replace NaN/inf
             pred[X_df["sun_up"] == 0] = 0.0
             return pred
 
-
-    
     return Wrapper(huber, calib)
+
 
 
 def _predict_block(df: pd.DataFrame, model, horizon: int):
