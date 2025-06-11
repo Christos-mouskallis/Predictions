@@ -260,7 +260,7 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
                 "cloud_bucket", "hour", "doy", "sun_up"]]
     y = merged["kwh"]
 
-    huber = HuberRegressor(alpha=0.0001, epsilon=1.5).fit(X, y)
+    huber = HuberRegressor(alpha=0.0001, epsilon=1.5, max_iter=500).fit(X, y)
 
     class Wrapper:
         def __init__(self, core):
@@ -279,17 +279,23 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
 
 # ── prediction helpers ───────────────────────────────────────────────────────
 def _predict_block(df: pd.DataFrame, model, horizon: int):
+    """Predict kWh for the first *horizon* rows of df."""
     blk = df.iloc[:horizon].copy()
-    blk["hour"] = blk.index.hour
-    blk["ghi_cs"] = blk.index.map(_clear_sky_wm2)
 
-    X = blk[["temp","humidity","clouds",
-             "cloud_bucket","ghi_cs","hour","sun_up"]].ffill()
+    # these two must be indented the same as blk = …
+    blk["hour"] = blk.index.hour
+    blk["doy"]  = blk.index.dayofyear
+
+    X = blk[["temp", "humidity", "clouds",
+             "cloud_bucket", "hour", "doy", "sun_up"]].ffill()
 
     blk["pred_kwh"] = model.predict(X)
+    blk.loc[blk["sun_up"] == 0, "pred_kwh"] = 0.0    # night clamp
+
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
     blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0
-    return blk[["pred_mwh","timestamp"]].round(4).to_dict("records")
+    return blk[["pred_mwh", "timestamp"]].round(4).to_dict("records")
+
 
 
 def make_forecasts(model, wx_hr: pd.DataFrame, wx_dl: pd.DataFrame):
