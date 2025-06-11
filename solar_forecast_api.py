@@ -97,7 +97,7 @@ def get_solar_history(days: int = HIST_DAYS) -> pd.DataFrame:
       .set_index("ts")
       .sort_index()       # ← sort first …
       .loc[start:now]     # ← … then slice (no KeyError)
-      .resample("1H").sum(min_count=1)
+      .resample("1h").sum(min_count=1)
       .fillna(0.0)
     )
     return df
@@ -215,10 +215,12 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
     )
 
     merged = solar_hr.merge(wx_hist_agg, on="ts_hour", how="inner").dropna()
-    if len(merged) < 12:                         # too little data → zero model
-        class ZeroModel:
-            def predict(self, X): return np.zeros(len(X))
-        return ZeroModel()
+    if len(merged) < 12:         
+    class ZeroModel:
+        def predict(self, X):  
+            return np.zeros(len(X))
+    return ZeroModel()       
+
 
     # -------- target: log of absolute production ---------------------------
     merged["hour"] = merged["ts_hour"].dt.hour
