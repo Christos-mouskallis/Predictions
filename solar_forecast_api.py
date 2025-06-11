@@ -74,6 +74,20 @@ def _cloud_bucket(pct: float) -> int:
     if pct < 80:   return 2
     return 3
 
+def _clear_sky_wm2(ts_utc: pd.Timestamp, lat: float = LAT) -> float:
+    """Simple clear-sky GHI W/m² from solar-zenith (no atm model)."""
+    day_angle = 2 * np.pi * (ts_utc.dayofyear - 1) / 365
+    decl = 0.006918 - 0.399912*np.cos(day_angle) + 0.070257*np.sin(day_angle)
+    + 0.006758*np.cos(2*day_angle) + 0.000907*np.sin(2*day_angle)
+    + 0.002697*np.cos(3*day_angle) + 0.00148*np.sin(3*day_angle)
+    hour_angle = (ts_utc.hour + ts_utc.minute/60 - 12) * 15 * np.pi/180
+    lat_rad = lat * np.pi/180
+    cos_zen = (np.sin(lat_rad)*np.sin(decl) +
+               np.cos(lat_rad)*np.cos(decl)*np.cos(hour_angle))
+    cos_zen = max(cos_zen, 0)          # below horizon → 0
+    return 1367 * cos_zen              # extraterrestrial * cosθ
+
+
 # ── solar data ───────────────────────────────────────────────────────────────
 def get_solar_history(days: int = HIST_DAYS) -> pd.DataFrame:
     now   = dt.datetime.now(timezone.utc)
@@ -194,79 +208,79 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     return wx_hist, wx_hr, wx_dl
 
 
-# ── model ────────────────────────────────────────────────────────────────────
-# ── model ────────────────────────────────────────────────────────────────────
 def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
-    """
-    Returns an object with .predict(X_df) -> kWh.
-    If too little data, returns a ZeroModel that always predicts 0.
-    """
-    # ── merge solar & weather ------------------------------------------------
+    """Return model or ZeroModel if data too sparse."""
+
     solar_hr = solar.loc[lambda s: s["kwh"] != 0].reset_index()
     solar_hr["ts_hour"] = solar_hr["ts"].dt.floor("h")
 
-    wx_hist_agg = (
+    wx_hist = (
         wx_hist.reset_index()
-               .assign(ts_hour=lambda d: d["ts"].dt.floor("h"))
-               .groupby("ts_hour")
-               .agg(
-                   temp         = ("temp", "mean"),
-                   humidity     = ("humidity", "mean"),
-                   clouds       = ("clouds", "mean"),
-                   cloud_bucket = ("cloud_bucket", "max"),
-                   sun_up       = ("sun_up", "max"),
-               )
-               .reset_index()
+        .assign(ts_hour=lambda d: d["ts"].dt.floor("h"))
+        .groupby("ts_hour")
+        .agg(temp=("temp","mean"),
+             humidity=("humidity","mean"),
+             clouds=("clouds","mean"),
+             cloud_bucket=("cloud_bucket","max"),
+             sun_up=("sun_up","max"))
+        .reset_index()
     )
 
-    merged = solar_hr.merge(wx_hist_agg, on="ts_hour", how="inner").dropna()
+    merged = solar_hr.merge(wx_hist, on="ts_hour", how="inner").dropna()
+    if len(merged) < 24:                          # at least one day
+        class ZeroModel:                          # always-zero fallback
+            def predict(self, X): return np.zeros(len(X))
+        return ZeroModel()
 
-    # ── guard: if < 12 hourly records → fallback to zero model ---------------
-    if len(merged) < 12:
-        class ZeroModel:
-            def predict(self, X):            # keeps API identical
-                return np.zeros(len(X))
-        return ZeroModel()                   # ← INSTANCE, not class
+    # physics feature: clear-sky irradiance W/m²
+    merged["ghi_cs"] = merged["ts_hour"].apply(_clear_sky_wm2)
 
-    # ── feature engineering --------------------------------------------------
     merged["hour"] = merged["ts_hour"].dt.hour
-    merged["doy"]  = merged["ts_hour"].dt.dayofyear
+    X = merged[["temp","humidity","clouds",
+                "cloud_bucket","ghi_cs","hour","sun_up"]]
 
-    X = merged[["temp", "humidity", "clouds",
-                "cloud_bucket", "hour", "doy", "sun_up"]]
-    y = merged["kwh"]
+    # target: log(abs(kwh)); keep sign separate
+    merged["sign"] = np.sign(merged["kwh"])
+    y = np.log1p(np.abs(merged["kwh"]))
 
-    # ── train Gradient Boosting ---------------------------------------------
-    model = GradientBoostingRegressor(
+    gbr = GradientBoostingRegressor(
         n_estimators=400, learning_rate=0.05,
         max_depth=3, random_state=0
     ).fit(X, y)
 
-    return model
+    # hourly envelope for cap (120 % best)
+    env = (merged.groupby("hour")["kwh"]
+                .apply(lambda s: s.abs().max()*1.2)
+                .reindex(range(24), fill_value=0)).values
+
+    class Wrapper:
+        def __init__(self, core, env): self.core, self.env = core, env
+        def predict(self, X_df):
+            base = np.expm1(self.core.predict(X_df))   # back-transform
+            base = -base                               # production negative
+            # cap to envelope
+            hour_idx = X_df["hour"].to_numpy()
+            cap = self.env[hour_idx]
+            out = -np.minimum(base, cap)               # keep negative
+            out[X_df["sun_up"]==0] = 0.0               # night = 0
+            return out
+
+    return Wrapper(gbr, env)
 
 
 # ── prediction helpers ───────────────────────────────────────────────────────
 def _predict_block(df: pd.DataFrame, model, horizon: int):
-    """
-    Predict kWh for the first *horizon* rows of df.
-    Night hours (sun_up == 0) are always clamped to 0 kWh.
-    """
     blk = df.iloc[:horizon].copy()
     blk["hour"] = blk.index.hour
-    blk["doy"]  = blk.index.dayofyear
+    blk["ghi_cs"] = blk.index.map(_clear_sky_wm2)
 
-    X = blk[["temp", "humidity", "clouds",
-             "cloud_bucket", "hour", "doy", "sun_up"]].ffill()
+    X = blk[["temp","humidity","clouds",
+             "cloud_bucket","ghi_cs","hour","sun_up"]].ffill()
 
     blk["pred_kwh"] = model.predict(X)
-
-    # enforce zero production at night
-    blk.loc[blk["sun_up"] == 0, "pred_kwh"] = 0.0
-
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
     blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0
-    return blk[["pred_mwh", "timestamp"]].round(4).to_dict("records")
-
+    return blk[["pred_mwh","timestamp"]].round(4).to_dict("records")
 
 
 def make_forecasts(model, wx_hr: pd.DataFrame, wx_dl: pd.DataFrame):
