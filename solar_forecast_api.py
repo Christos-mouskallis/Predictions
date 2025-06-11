@@ -74,6 +74,11 @@ def _cloud_bucket(pct: float) -> int:
     if pct < 80:   return 2
     return 3
 
+def _safe_irrad(clouds: pd.Series | float) -> pd.Series | float:
+    """Return 1 – clouds%/100 clipped to [0,1]; scalar or Series."""
+    return 1.0 - np.clip(clouds, 0, 100) / 100.0
+
+
 def _daily_energy(series_kw: pd.Series) -> float:
     """Return absolute MWh energy for one day given hourly kWh series."""
     return series_kw.resample("1D").sum(min_count=12).abs().max()
@@ -238,7 +243,10 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
 
     merged["hour"] = merged["ts_hour"].dt.hour
     merged["doy"]  = merged["ts_hour"].dt.dayofyear
-    merged["irrad"] = 1.0 - merged["clouds"] / 100.0
+    merged["irrad"] = _safe_irrad(merged["clouds"])
+    # …
+    daylight["irrad"] = _safe_irrad(daylight["clouds"])
+
 
     # ── daylight subset ------------------------------------------------------
     daylight = merged[merged["sun_up"] == 1].copy()
@@ -276,32 +284,47 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
             self.core  = core
             self.calib = calibration
         def predict(self, X_df):
-            irrad = 1.0 - X_df["clouds"] / 100.0
+            irrad = _safe_irrad(X_df["clouds"])
             y_hat = expm1(self.core.predict(
                           X_df[["temp","humidity","clouds",
                                 "cloud_bucket","hour","doy"]]))
-            pred  = -y_hat * irrad                 # negative export
-            pred[X_df["sun_up"] == 0] = 0.0        # night = 0
+            y_hat = np.clip(y_hat, 0, np.nanmax(y_hat))        # remove inf
+            pred  = -y_hat * irrad
+            pred[~np.isfinite(pred)] = 0.0                     # replace NaN/inf
+            pred[X_df["sun_up"] == 0] = 0.0
             return pred
+
 
     
     return Wrapper(huber, calib)
 
 
 def _predict_block(df: pd.DataFrame, model, horizon: int):
+    """Return list[{pred_mwh, timestamp}] for the first *horizon* rows of df."""
     blk = df.iloc[:horizon].copy()
+
+    # add time-based features
     blk["hour"] = blk.index.hour
     blk["doy"]  = blk.index.dayofyear
 
+    # feature matrix (forward-filled for safety)
     X = blk[["temp", "humidity", "clouds",
              "cloud_bucket", "hour", "doy", "sun_up"]].ffill()
 
-    blk["pred_kwh"] = model.predict(X) * model.calib
+    # raw kWh prediction × global calibration
+    blk["pred_kwh"] = model.predict(X) * getattr(model, "calib", 1.0)
+
+    # night-time clamp
     blk.loc[blk["sun_up"] == 0, "pred_kwh"] = 0.0
 
+    # replace inf / NaN with 0
+    blk["pred_kwh"].replace([np.inf, -np.inf], 0.0, inplace=True)
+    blk["pred_kwh"].fillna(0.0, inplace=True)
 
+    # convert to MWh for output
+    blk["pred_mwh"] = blk["pred_kwh"] / 1000.0
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
-    blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0           # keep energy
+
     return blk[["pred_mwh", "timestamp"]].round(4).to_dict("records")
 
 
