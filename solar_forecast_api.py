@@ -200,7 +200,8 @@ from sklearn.linear_model import HuberRegressor
 from numpy import log1p, expm1, clip, zeros
 
 def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
-    """Return a robust production model; always returns an object with .predict(df)."""
+    """Fit log-capacity-factor model. Always returns an object with .predict(df)."""
+    # ── join solar + weather ────────────────────────────────────────────────
     solar_hr = solar[solar["kwh"] != 0].reset_index()
     solar_hr["ts_hour"] = solar_hr["ts"].dt.floor("h")
 
@@ -219,61 +220,46 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
     )
 
     merged = solar_hr.merge(wx_hist_agg, on="ts_hour", how="inner").dropna()
+    if merged.empty:
+        class ZeroModel:                   # rare: no overlap
+            def predict(self, X): return zeros(len(X))
+        return ZeroModel()
+
     merged["hour"] = merged["ts_hour"].dt.hour
     merged["doy"]  = merged["ts_hour"].dt.dayofyear
-    merged["irrad"]= 1.0 - merged["clouds"] / 100.0
+    merged["irrad"] = 1.0 - merged["clouds"] / 100.0
 
-    # daylight rows for capacity fit
+    # ── daylight subset ------------------------------------------------------
     daylight = merged[merged["sun_up"] == 1].copy()
+    if daylight.empty:                     # all-night data set
+        class ZeroModel:
+            def predict(self, X): return zeros(len(X))
+        return ZeroModel()
 
-    # -------- guard: if no daylight rows, use median fallback ---------------
-    if daylight.empty:
-        per_hour_median = (
-            merged.groupby("hour")["kwh"].median()
-                   .reindex(range(24), fill_value=0.0).abs() * 1.10
-        )
+    daylight["cf"] = (daylight["kwh"].abs() /
+                      daylight["irrad"].clip(lower=0.1))
 
-        class MedianModel:
-            def __init__(self, med): self.med = med.values
-            def predict(self, X):
-                out = -self.med[X["hour"].to_numpy()] * (1 - X["clouds"]/100)
-                out[X["sun_up"] == 0] = 0.0
-                return out
+    y = log1p(daylight["cf"])
+    X = daylight[["temp", "humidity", "clouds",
+                  "cloud_bucket", "hour", "doy"]]
 
-        return MedianModel(per_hour_median)
+    huber = HuberRegressor(max_iter=400, epsilon=1.5).fit(X, y)
 
-    # -------- robust capacity fit ------------------------------------------
-    daylight["irrad"] = 1.0 - daylight["clouds"] / 100.0
-    daylight["y_norm"] = daylight["kwh"].abs() / daylight["irrad"].clip(lower=0.1)
-    y = np.log1p(daylight["y_norm"])
-    X_cap = daylight[["temp", "humidity", "clouds",
-                      "cloud_bucket", "hour", "doy"]]
-
-    huber = HuberRegressor(max_iter=500, epsilon=1.5).fit(X_cap, y)
-
-
-    # hourly physical cap (110 % of best in last 30 days)
-    
-
+    # ── simple wrapper to rebuild kWh ---------------------------------------
     class Wrapper:
-        def __init__(self, core, cap):
-            self.core = core
-            self.cap  = cap        # length-24 numpy
-
+        def __init__(self, core): self.core = core
         def predict(self, X_df):
             irrad = 1.0 - X_df["clouds"] / 100.0
-            cap   = self.cap[X_df["hour"].to_numpy()]
             y_hat = expm1(self.core.predict(
-                          X_df[["temp","humidity","clouds","cloud_bucket","hour","doy"]]))
-            pred  = -y_hat * irrad       # negative = export
-            pred  = clip(pred, -cap, 0)  # never exceed cap
-            pred[X_df["sun_up"] == 0] = 0.0
+                          X_df[["temp","humidity","clouds",
+                                "cloud_bucket","hour","doy"]]))
+            pred  = -y_hat * irrad                 # negative export
+            pred[X_df["sun_up"] == 0] = 0.0        # night = 0
             return pred
 
-    return Wrapper(huber, hour_cap)
+    return Wrapper(huber)
 
 
-# ── prediction helpers ───────────────────────────────────────────────────────
 def _predict_block(df: pd.DataFrame, model, horizon: int):
     blk = df.iloc[:horizon].copy()
     blk["hour"] = blk.index.hour
@@ -285,8 +271,9 @@ def _predict_block(df: pd.DataFrame, model, horizon: int):
     blk["pred_kwh"] = model.predict(X)
 
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
-    blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0
+    blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0           # keep energy
     return blk[["pred_mwh", "timestamp"]].round(4).to_dict("records")
+
 
 
 
