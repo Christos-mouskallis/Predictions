@@ -200,6 +200,7 @@ from sklearn.linear_model import HuberRegressor
 from numpy import log1p, expm1, clip, zeros
 
 def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
+    """Return a robust production model; always returns an object with .predict(df)."""
     solar_hr = solar[solar["kwh"] != 0].reset_index()
     solar_hr["ts_hour"] = solar_hr["ts"].dt.floor("h")
 
@@ -218,48 +219,58 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
     )
 
     merged = solar_hr.merge(wx_hist_agg, on="ts_hour", how="inner").dropna()
-    if len(merged) < 24:            # not enough overlap → baseline zero model
-        class ZeroModel:
-            def predict(self, X): return np.zeros(len(X))
-        return ZeroModel()
-
-    # feature engineering
     merged["hour"] = merged["ts_hour"].dt.hour
     merged["doy"]  = merged["ts_hour"].dt.dayofyear
-    merged["irrad"] = 1.0 - merged["clouds"] / 100.0
-    merged = merged[merged["irrad"] > 0]          # keep daylight only
+    merged["irrad"]= 1.0 - merged["clouds"] / 100.0
 
-    # 1️⃣ estimate panel rating (median of top 5 % clear-sky points)
-    merged["kw_clear"] = merged["kwh"].abs() / merged["irrad"]
-    top = merged["kw_clear"].quantile(0.95)
-    panel_rating = merged.loc[merged["kw_clear"] >= top, "kw_clear"].median()
-    if panel_rating == 0 or np.isnan(panel_rating):
-        panel_rating = 10.0                         # fallback: 10 MWh/h
+    # daylight rows for capacity fit
+    daylight = merged[merged["sun_up"] == 1].copy()
 
-    # 2️⃣ target = capacity factor 0–1
-    merged["cf"] = (merged["kwh"].abs() /
-                    (panel_rating * merged["irrad"].clip(lower=0.05))).clip(0, 1)
+    # -------- guard: if no daylight rows, use median fallback ---------------
+    if daylight.empty:
+        per_hour_median = (
+            merged.groupby("hour")["kwh"].median()
+                   .reindex(range(24), fill_value=0.0).abs() * 1.10
+        )
 
-    X = merged[["temp", "humidity", "clouds",
-                "cloud_bucket", "hour", "doy"]]
-    y = merged["cf"]
+        class MedianModel:
+            def __init__(self, med): self.med = med.values
+            def predict(self, X):
+                out = -self.med[X["hour"].to_numpy()] * (1 - X["clouds"]/100)
+                out[X["sun_up"] == 0] = 0.0
+                return out
 
-    huber = HuberRegressor(max_iter=500, epsilon=1.5).fit(X, y)
+        return MedianModel(per_hour_median)
+
+    # -------- robust capacity fit ------------------------------------------
+    daylight["irrad"] = 1.0 - daylight["clouds"] / 100.0
+    daylight["y_norm"] = daylight["kwh"].abs() / daylight["irrad"].clip(lower=0.1)
+    y = np.log1p(daylight["y_norm"])
+    X_cap = daylight[["temp", "humidity", "clouds",
+                      "cloud_bucket", "hour", "doy"]]
+
+    huber = HuberRegressor(max_iter=500, epsilon=1.5).fit(X_cap, y)
+
+
+    # hourly physical cap (110 % of best in last 30 days)
+    
 
     class Wrapper:
-        def __init__(self, core, rating):
+        def __init__(self, core, cap):
             self.core = core
-            self.rating = rating
+            self.cap  = cap        # length-24 numpy
+
         def predict(self, X_df):
             irrad = 1.0 - X_df["clouds"] / 100.0
-            cf    = np.clip(self.core.predict(
-                        X_df[["temp","humidity","clouds",
-                              "cloud_bucket","hour","doy"]]), 0, 1)
-            pred  = -cf * self.rating * irrad
+            cap   = self.cap[X_df["hour"].to_numpy()]
+            y_hat = expm1(self.core.predict(
+                          X_df[["temp","humidity","clouds","cloud_bucket","hour","doy"]]))
+            pred  = -y_hat * irrad       # negative = export
+            pred  = clip(pred, -cap, 0)  # never exceed cap
             pred[X_df["sun_up"] == 0] = 0.0
             return pred
 
-    return Wrapper(huber, panel_rating)
+    return Wrapper(huber, hour_cap)
 
 
 # ── prediction helpers ───────────────────────────────────────────────────────
@@ -271,11 +282,11 @@ def _predict_block(df: pd.DataFrame, model, horizon: int):
     X = blk[["temp", "humidity", "clouds",
              "cloud_bucket", "hour", "doy", "sun_up"]].ffill()
 
-    blk["pred_kw"] = model.predict(X) * 1000     # kWh → kW (power over the hour)
-    blk["pred_kw"][blk["sun_up"] == 0] = 0.0
+    blk["pred_kwh"] = model.predict(X)
+
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
-    blk["pred_mw"] = (blk["pred_kw"] / 1000.0).round(2)   # MW for Grafana
-    return blk[["pred_mw", "timestamp"]].to_dict("records")
+    blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0
+    return blk[["pred_mwh", "timestamp"]].round(4).to_dict("records")
 
 
 
