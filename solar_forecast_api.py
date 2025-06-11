@@ -253,7 +253,10 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
 
 
     # hourly physical cap (110 % of best in last 30 days)
-    
+    hour_cap = (
+        merged.groupby("hour")["kwh"].apply(lambda s: s.abs().max())
+        .reindex(range(24), fill_value=0.0).values * 0.25
+    )
 
     class Wrapper:
         def __init__(self, core, cap):
