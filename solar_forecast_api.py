@@ -97,7 +97,7 @@ def get_solar_history(days: int = HIST_DAYS) -> pd.DataFrame:
       .set_index("ts")
       .sort_index()       # ← sort first …
       .loc[start:now]     # ← … then slice (no KeyError)
-      .resample("1H").sum(min_count=1)
+      .resample("1h").sum(min_count=1)
       .fillna(0.0)
     )
     return df
@@ -223,11 +223,14 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
     merged["doy"]  = merged["ts_hour"].dt.dayofyear
     merged["irrad"]= 1.0 - merged["clouds"] / 100.0
 
-    # --- guard: too few points → median fallback ---------------------------------
-    if len(merged) < 24:
+    # daylight rows for capacity fit
+    daylight = merged[merged["sun_up"] == 1].copy()
+
+    # -------- guard: if no daylight rows, use median fallback ---------------
+    if daylight.empty:
         per_hour_median = (
             merged.groupby("hour")["kwh"].median()
-                   .reindex(range(24), fill_value=0.0).abs() * 1.1
+                   .reindex(range(24), fill_value=0.0).abs() * 1.10
         )
 
         class MedianModel:
@@ -236,17 +239,18 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
                 out = -self.med[X["hour"].to_numpy()] * (1 - X["clouds"]/100)
                 out[X["sun_up"] == 0] = 0.0
                 return out
+
         return MedianModel(per_hour_median)
 
-    # keep only daylight rows for fitting capacity factor
-    daylight = merged[merged["sun_up"] == 1].copy()
+    # -------- robust capacity fit ------------------------------------------
+    daylight["irrad"] = 1.0 - daylight["clouds"] / 100.0
     daylight["y_norm"] = daylight["kwh"].abs() / daylight["irrad"].clip(lower=0.1)
-    y = log1p(daylight["y_norm"])
+    y = np.log1p(daylight["y_norm"])
+    X_cap = daylight[["temp", "humidity", "clouds",
+                      "cloud_bucket", "hour", "doy"]]
 
-    X = daylight[["temp", "humidity", "clouds",
-                  "cloud_bucket", "hour", "doy"]]
+    huber = HuberRegressor(max_iter=500, epsilon=1.5).fit(X_cap, y)
 
-    huber = HuberRegressor(max_iter=500, epsilon=1.5).fit(X, y)
 
     # hourly physical cap (110 % of best in last 30 days)
     hour_cap = (
