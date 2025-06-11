@@ -127,15 +127,20 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             temp     = lambda d: d["main"].apply(lambda m: m["temp"]),
             humidity = lambda d: d["main"].apply(lambda m: m["humidity"]),
             clouds   = lambda d: d["clouds"].apply(lambda c: c["all"]),
-            sun_up   = lambda d: d["sys"].apply(
-                lambda s: 1 if s.get("pod", "n") == "d" else 0
-            ) if "sys" in d.columns else d["weather"].apply(
-                lambda w: 1 if w[0]["icon"].endswith("d") else 0
-            ),
         )
-        .set_index("ts")[["temp", "humidity", "clouds", "sun_up"]]
     )
+
+# row-wise derive sun_up from sys.pod, falling back to icon d/n
+    wx_hr["sun_up"] = wx_hr.apply(
+        lambda row: 1
+            if (row.get("sys", {}).get("pod") == "d")
+               or (row["weather"][0]["icon"].endswith("d"))
+            else 0,
+        axis=1,
+    )
+    wx_hr = wx_hr.set_index("ts")[["temp", "humidity", "clouds", "sun_up"]]
     wx_hr["cloud_bucket"] = wx_hr["clouds"].apply(_cloud_bucket)
+
 
     # ---------- 30-day HOURLY history ---------------------------------------
     hist_rows = []
@@ -160,7 +165,8 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                     humidity     = itm["main"]["humidity"],
                     clouds       = clouds,
                     cloud_bucket = _cloud_bucket(clouds),
-                    sun_up       = 1 if itm.get("sys", {}).get("pod", "n") == "d" else 0,
+                    sun_up = 1 if itm.get("sys", {}).get("pod", "n") == "d" \
+                                or itm["weather"][0]["icon"].endswith("d") else 0,
                 )
             )
 
