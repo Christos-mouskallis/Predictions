@@ -303,15 +303,13 @@ def _predict_block(df: pd.DataFrame, model, horizon: int):
     # night-time clamp
     blk.loc[blk["sun_up"] == 0, "pred_kwh"] = 0.0
 
-    # replace inf / NaN with 0
-    blk["pred_kwh"].replace([np.inf, -np.inf], 0.0, inplace=True)
-    blk["pred_kwh"].fillna(0.0, inplace=True)
+    blk["pred_kwh"] = blk["pred_kwh"].replace([np.inf, -np.inf], 0.0)
+    blk["pred_kwh"] = blk["pred_kwh"].fillna(0.0)
 
-    # convert to MWh for output
-    blk["pred_mwh"] = blk["pred_kwh"] / 1000.0
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
-
+    blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0
     return blk[["pred_mwh", "timestamp"]].round(4).to_dict("records")
+
 
 
 
