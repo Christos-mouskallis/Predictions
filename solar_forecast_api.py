@@ -256,18 +256,19 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
 
     huber = HuberRegressor(max_iter=400, epsilon=1.5).fit(X, y)
         # --- calibration: best real vs best fitted day -------------------------
+# --- calibration: best real vs best fitted day -------------------------
     best_real = merged.groupby("ts_hour")["kwh"].sum().abs().max()
-
-    # predict on merged daylight rows to estimate model’s best
-    y_hat = huber.predict(X)
+    
+    y_hat = huber.predict(X)                      # len = daylight rows
     best_pred = (
-        pd.Series(y_hat, index=merged["ts_hour"])
-          .groupby(merged["ts_hour"])
+        pd.Series(y_hat, index=daylight["ts_hour"])  # ← use daylight index
+          .groupby(daylight["ts_hour"])
           .sum()
           .abs()
           .max()
     )
     calib = 1.0 if best_pred == 0 else best_real / best_pred
+
 
     # ── simple wrapper to rebuild kWh ---------------------------------------
     class Wrapper:
