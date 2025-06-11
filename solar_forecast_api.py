@@ -271,10 +271,11 @@ def _predict_block(df: pd.DataFrame, model, horizon: int):
     X = blk[["temp", "humidity", "clouds",
              "cloud_bucket", "hour", "doy", "sun_up"]].ffill()
 
-    blk["pred_kwh"] = model.predict(X)
+    blk["pred_kw"] = model.predict(X) * 1000     # kWh → kW (power over the hour)
+    blk["pred_kw"][blk["sun_up"] == 0] = 0.0
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
-    blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0
-    return blk[["pred_mwh", "timestamp"]].round(4).to_dict("records")
+    blk["pred_mw"] = (blk["pred_kw"] / 1000.0).round(2)   # MW for Grafana
+    return blk[["pred_mw", "timestamp"]].to_dict("records")
 
 
 
