@@ -196,6 +196,7 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
 # ── model ────────────────────────────────────────────────────────────────────
 def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
+    # keep only hours where production/consumption ≠ 0
     solar_hr = solar.loc[lambda s: s["kwh"] != 0].reset_index()
     solar_hr["ts_hour"] = solar_hr["ts"].dt.floor("h")
 
@@ -211,31 +212,48 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
                    sun_up       = ("sun_up", "max"),
                )
                .reset_index()
-               .set_index("ts_hour")
-               .asfreq("1h")
-               .ffill()
-               .reset_index()
     )
 
     merged = solar_hr.merge(wx_hist_agg, on="ts_hour", how="inner").dropna()
-    if len(merged) < 12:                # allow smaller data sets
+    if len(merged) < 12:                         # too little data → zero model
         class ZeroModel:
             def predict(self, X): return np.zeros(len(X))
         return ZeroModel()
 
+    # -------- target: log of absolute production ---------------------------
     merged["hour"] = merged["ts_hour"].dt.hour
     merged["doy"]  = merged["ts_hour"].dt.dayofyear
 
     X = merged[["temp", "humidity", "clouds",
                 "cloud_bucket", "hour", "doy", "sun_up"]]
-    y = merged["kwh"]
 
-    return GradientBoostingRegressor(
-        n_estimators=400,
-        learning_rate=0.05,
-        max_depth=3,
-        random_state=0
+    y = np.log1p(merged["kwh"].abs())            # log-scaled magnitude
+    sign = np.sign(merged["kwh"].values)         # store sign separately
+
+    model = GradientBoostingRegressor(
+        n_estimators=400, learning_rate=0.05, max_depth=3, random_state=0
     ).fit(X, y)
+
+    # we also need historic hour-max for post-cap
+    hist_max = (merged.groupby("hour")["kwh"].apply(lambda s: s.abs().max())
+                         .reindex(range(24), fill_value=0.0) * 1.10)  # +10 %
+
+    # bundle everything in a tiny wrapper -------------------------------------------------
+    class Wrapper:
+        def __init__(self, core, hour_max):       # hour_max is a 24-length Series
+            self.core = core
+            self.hour_max = hour_max.values
+
+        def predict(self, X_df: pd.DataFrame):
+            preds = np.expm1(self.core.predict(X_df))     # back-transform
+            preds *= -1                                   # production is negative
+            # cap to 110 % historic best for that hour
+            hour_col = X_df["hour"].to_numpy()
+            cap = self.hour_max[hour_col]
+            preds = np.clip(preds, -cap, 0.0)
+            # zero at night
+            preds[X]()
+
 
 # ── prediction helpers ───────────────────────────────────────────────────────
 def _predict_block(df, model, horizon):
@@ -244,9 +262,10 @@ def _predict_block(df, model, horizon):
     blk["doy"]  = blk.index.dayofyear
 
     X = blk[["temp", "humidity", "clouds",
-             "cloud_bucket", "hour", "doy", "sun_up"]].ffill()
+            "cloud_bucket", "hour", "doy", "sun_up"]].ffill()
 
-    blk["pred_kwh"] = model.predict(X)
+    blk["pred_kwh"] = model.predict(X)            # wrapper handles log/back-cap
+
     blk.loc[blk["sun_up"] == 0, "pred_kwh"] = 0.0    # force zero at night
 
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
