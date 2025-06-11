@@ -74,6 +74,11 @@ def _cloud_bucket(pct: float) -> int:
     if pct < 80:   return 2
     return 3
 
+def _daily_energy(series_kw: pd.Series) -> float:
+    """Return absolute MWh energy for one day given hourly kWh series."""
+    return series_kw.resample("1D").sum(min_count=12).abs().max()
+
+
 # ── solar data ───────────────────────────────────────────────────────────────
 def get_solar_history(days: int = HIST_DAYS) -> pd.DataFrame:
     now   = dt.datetime.now(timezone.utc)
@@ -282,9 +287,26 @@ def _predict_block(df: pd.DataFrame, model, horizon: int):
 
 
 
-
 def make_forecasts(model, wx_hr: pd.DataFrame, wx_dl: pd.DataFrame):
+    # --- raw hourly prediction (24 h) --------------------------------------
     hourly = _predict_block(wx_hr, model, 24)
+
+    # --- compute calibration factor ----------------------------------------
+    # 1) best real energy in the last 30 d
+    best_real = _daily_energy(solar_history["kwh"])      # needs solar_history in scope
+    # 2) best energy the model just predicted for tomorrow
+    tmp = pd.DataFrame(hourly).set_index(
+        pd.to_datetime([pt["timestamp"] for pt in hourly], unit="s", utc=True)
+    )
+    tmp["kwh"] = [pt["pred_mwh"] * 1000 for pt in hourly]
+    best_pred = _daily_energy(tmp["kwh"])
+
+    calib = 1.0 if best_pred == 0 else best_real / best_pred
+
+    # apply calibration to every hourly point
+    for pt in hourly:
+        pt["pred_mwh"] *= calib
+
 
     def _expand_day(row_ts, row_vals):
         """Build a 24-hour synthetic frame for one daily forecast row."""
@@ -319,6 +341,8 @@ def make_forecasts(model, wx_hr: pd.DataFrame, wx_dl: pd.DataFrame):
     for ts, row in wx_dl.iloc[1:8].iterrows():  # Only 7 days instead of 16
         synth_df = _expand_day(ts, row)
         block = _predict_block(synth_df, model, 24)
+        for pt in block:                                # ← ADD these two lines
+            pt["pred_mwh"] *= cal
         day_val = round(sum(pt["pred_mwh"] for pt in block), 4)
         daily_records.append(
             {"pred_mwh": day_val, "timestamp": int(ts.floor("D").timestamp())}
