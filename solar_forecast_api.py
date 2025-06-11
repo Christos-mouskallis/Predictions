@@ -255,10 +255,25 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
                   "cloud_bucket", "hour", "doy"]]
 
     huber = HuberRegressor(max_iter=400, epsilon=1.5).fit(X, y)
+        # --- calibration: best real vs best fitted day -------------------------
+    best_real = merged.groupby("ts_hour")["kwh"].sum().abs().max()
+
+    # predict on merged daylight rows to estimate model’s best
+    y_hat = huber.predict(X)
+    best_pred = (
+        pd.Series(y_hat, index=merged["ts_hour"])
+          .groupby(merged["ts_hour"])
+          .sum()
+          .abs()
+          .max()
+    )
+    calib = 1.0 if best_pred == 0 else best_real / best_pred
 
     # ── simple wrapper to rebuild kWh ---------------------------------------
     class Wrapper:
-        def __init__(self, core): self.core = core
+        def __init__(self, core, calibration):
+            self.core  = core
+            self.calib = calibration
         def predict(self, X_df):
             irrad = 1.0 - X_df["clouds"] / 100.0
             y_hat = expm1(self.core.predict(
@@ -268,7 +283,8 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
             pred[X_df["sun_up"] == 0] = 0.0        # night = 0
             return pred
 
-    return Wrapper(huber)
+    
+    return Wrapper(huber, calib)
 
 
 def _predict_block(df: pd.DataFrame, model, horizon: int):
@@ -279,7 +295,9 @@ def _predict_block(df: pd.DataFrame, model, horizon: int):
     X = blk[["temp", "humidity", "clouds",
              "cloud_bucket", "hour", "doy", "sun_up"]].ffill()
 
-    blk["pred_kwh"] = model.predict(X)
+    blk["pred_kwh"] = model.predict(X) * model.calib
+    blk.loc[blk["sun_up"] == 0, "pred_kwh"] = 0.0
+
 
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
     blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0           # keep energy
