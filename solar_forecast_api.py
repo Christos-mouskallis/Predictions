@@ -22,7 +22,6 @@ import requests
 from dateutil.relativedelta import relativedelta
 from flask import Flask, jsonify, Response
 from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.linear_model import HuberRegressor
 from apscheduler.schedulers.background import BackgroundScheduler
 
 
@@ -75,20 +74,6 @@ def _cloud_bucket(pct: float) -> int:
     if pct < 80:   return 2
     return 3
 
-def _clear_sky_wm2(ts_utc: pd.Timestamp, lat: float = LAT) -> float:
-    """Simple clear-sky GHI W/m² from solar-zenith (no atm model)."""
-    day_angle = 2 * np.pi * (ts_utc.dayofyear - 1) / 365
-    decl = 0.006918 - 0.399912*np.cos(day_angle) + 0.070257*np.sin(day_angle)
-    + 0.006758*np.cos(2*day_angle) + 0.000907*np.sin(2*day_angle)
-    + 0.002697*np.cos(3*day_angle) + 0.00148*np.sin(3*day_angle)
-    hour_angle = (ts_utc.hour + ts_utc.minute/60 - 12) * 15 * np.pi/180
-    lat_rad = lat * np.pi/180
-    cos_zen = (np.sin(lat_rad)*np.sin(decl) +
-               np.cos(lat_rad)*np.cos(decl)*np.cos(hour_angle))
-    cos_zen = max(cos_zen, 0)          # below horizon → 0
-    return 1367 * cos_zen              # extraterrestrial * cosθ
-
-
 # ── solar data ───────────────────────────────────────────────────────────────
 def get_solar_history(days: int = HIST_DAYS) -> pd.DataFrame:
     now   = dt.datetime.now(timezone.utc)
@@ -112,7 +97,7 @@ def get_solar_history(days: int = HIST_DAYS) -> pd.DataFrame:
       .set_index("ts")
       .sort_index()       # ← sort first …
       .loc[start:now]     # ← … then slice (no KeyError)
-      .resample("1h").sum(min_count=1)
+      .resample("1H").sum(min_count=1)
       .fillna(0.0)
     )
     return df
@@ -211,11 +196,7 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
 # ── model ────────────────────────────────────────────────────────────────────
 def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
-    """
-    Robust model that falls back to per-hour medians when not enough data.
-    Uses only allowed features. Always returns an object with .predict(df).
-    """
-    solar_hr = solar[solar["kwh"] != 0].reset_index()
+    solar_hr = solar.loc[lambda s: s["kwh"] != 0].reset_index()
     solar_hr["ts_hour"] = solar_hr["ts"].dt.floor("h")
 
     wx_hist_agg = (
@@ -230,59 +211,35 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
                    sun_up       = ("sun_up", "max"),
                )
                .reset_index()
+               .set_index("ts_hour")
+               .asfreq("1h")
+               .ffill()
+               .reset_index()
     )
 
     merged = solar_hr.merge(wx_hist_agg, on="ts_hour", how="inner").dropna()
+    if len(merged) < 12:                # allow smaller data sets
+        class ZeroModel:
+            def predict(self, X): return np.zeros(len(X))
+        return ZeroModel()
+
     merged["hour"] = merged["ts_hour"].dt.hour
     merged["doy"]  = merged["ts_hour"].dt.dayofyear
 
-    # ---------- fallback if too little data ---------------------------------
-    if len(merged) < 24:                         # < one day of overlap
-        per_hour_median = (
-            merged.groupby("hour")["kwh"].median()
-                   .reindex(range(24), fill_value=0.0)
-        )
-
-        class MedianModel:
-            def __init__(self, med):
-                self.med = med.values            # length-24 vector
-            def predict(self, X):
-                out = np.zeros(len(X))
-                hrs = X["hour"].to_numpy()
-                out[:] = -np.abs(self.med[hrs])  # negative = production
-                out[X["sun_up"] == 0] = 0.0      # zero at night
-                return out
-
-        return MedianModel(per_hour_median)
-
-    # ---------- robust linear model -----------------------------------------
     X = merged[["temp", "humidity", "clouds",
                 "cloud_bucket", "hour", "doy", "sun_up"]]
     y = merged["kwh"]
 
-    huber = HuberRegressor(alpha=0.0001, epsilon=1.5, max_iter=500).fit(X, y)
-
-    class Wrapper:
-        def __init__(self, core):
-            self.core = core
-        def predict(self, X_df):
-            pred = self.core.predict(
-                X_df[["temp", "humidity", "clouds",
-                      "cloud_bucket", "hour", "doy", "sun_up"]]
-            )
-            pred[X_df["sun_up"] == 0] = 0.0      # force zero at night
-            return pred
-
-    return Wrapper(huber)
-
-
+    return GradientBoostingRegressor(
+        n_estimators=400,
+        learning_rate=0.05,
+        max_depth=3,
+        random_state=0
+    ).fit(X, y)
 
 # ── prediction helpers ───────────────────────────────────────────────────────
-def _predict_block(df: pd.DataFrame, model, horizon: int):
-    """Predict kWh for the first *horizon* rows of df."""
+def _predict_block(df, model, horizon):
     blk = df.iloc[:horizon].copy()
-
-    # these two must be indented the same as blk = …
     blk["hour"] = blk.index.hour
     blk["doy"]  = blk.index.dayofyear
 
@@ -290,12 +247,11 @@ def _predict_block(df: pd.DataFrame, model, horizon: int):
              "cloud_bucket", "hour", "doy", "sun_up"]].ffill()
 
     blk["pred_kwh"] = model.predict(X)
-    blk.loc[blk["sun_up"] == 0, "pred_kwh"] = 0.0    # night clamp
+    blk.loc[blk["sun_up"] == 0, "pred_kwh"] = 0.0    # force zero at night
 
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
     blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0
     return blk[["pred_mwh", "timestamp"]].round(4).to_dict("records")
-
 
 
 def make_forecasts(model, wx_hr: pd.DataFrame, wx_dl: pd.DataFrame):
