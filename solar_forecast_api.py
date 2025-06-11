@@ -256,26 +256,29 @@ def make_forecasts(model, wx_hr: pd.DataFrame, wx_dl: pd.DataFrame):
     hourly = _predict_block(wx_hr, model, 24)
 
     def _expand_day(row_ts, row_vals):
-    base       = row_ts.floor("D")
-    sunrise_s  = row_vals["sunrise"]
-    sunset_s   = row_vals["sunset"]
-    clouds_pct = row_vals["clouds"]
-    temp_val   = row_vals["temp"]
-    hum_val    = row_vals["humidity"]
-
-    idx = [base + pd.Timedelta(hours=h) for h in range(24)]
-    return pd.DataFrame(
-        {
-            "temp":         temp_val,
-            "humidity":     hum_val,
-            "clouds":       clouds_pct,
-            "cloud_bucket": _cloud_bucket(clouds_pct),
-            "sun_up": [
-                1 if sunrise_s <= t.timestamp() <= sunset_s else 0 for t in idx
-            ],
-        },
-        index=idx,
-    )
+        """Build a 24-hour synthetic frame for one daily forecast row."""
+        base       = row_ts.floor("D")
+        sunrise_s  = row_vals["sunrise"]
+        sunset_s   = row_vals["sunset"]
+        clouds_pct = row_vals["clouds"]
+        temp_val   = row_vals["temp"]
+        hum_val    = row_vals["humidity"]
+    
+        idx = [base + pd.Timedelta(hours=h) for h in range(24)]
+    
+        return pd.DataFrame(
+            {
+                "temp":         temp_val,
+                "humidity":     hum_val,
+                "clouds":       clouds_pct,
+                "cloud_bucket": _cloud_bucket(clouds_pct),
+                "sun_up": [
+                    1 if sunrise_s <= t.timestamp() <= sunset_s else 0
+                    for t in idx
+                ],
+            },
+            index=idx,
+        )
 
     daily_records = []
     day0_ts = pd.to_datetime(hourly[0]["timestamp"], unit="s", utc=True).floor("D")
