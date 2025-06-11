@@ -216,10 +216,10 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
 
     merged = solar_hr.merge(wx_hist_agg, on="ts_hour", how="inner").dropna()
     if len(merged) < 12:         
-    class ZeroModel:
-        def predict(self, X):  
-            return np.zeros(len(X))
-    return ZeroModel()       
+        class ZeroModel:
+            def predict(self, X):  
+                return np.zeros(len(X))
+        return ZeroModel()       
 
 
     # -------- target: log of absolute production ---------------------------
