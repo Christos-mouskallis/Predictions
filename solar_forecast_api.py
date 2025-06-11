@@ -22,6 +22,7 @@ import requests
 from dateutil.relativedelta import relativedelta
 from flask import Flask, jsonify, Response
 from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.linear_model import HuberRegressor
 from apscheduler.schedulers.background import BackgroundScheduler
 
 
@@ -208,64 +209,72 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     return wx_hist, wx_hr, wx_dl
 
 
+# ── model ────────────────────────────────────────────────────────────────────
 def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
-    """Return model or ZeroModel if data too sparse."""
-
-    solar_hr = solar.loc[lambda s: s["kwh"] != 0].reset_index()
+    """
+    Robust model that falls back to per-hour medians when not enough data.
+    Uses only allowed features. Always returns an object with .predict(df).
+    """
+    solar_hr = solar[solar["kwh"] != 0].reset_index()
     solar_hr["ts_hour"] = solar_hr["ts"].dt.floor("h")
 
-    wx_hist = (
+    wx_hist_agg = (
         wx_hist.reset_index()
-        .assign(ts_hour=lambda d: d["ts"].dt.floor("h"))
-        .groupby("ts_hour")
-        .agg(temp=("temp","mean"),
-             humidity=("humidity","mean"),
-             clouds=("clouds","mean"),
-             cloud_bucket=("cloud_bucket","max"),
-             sun_up=("sun_up","max"))
-        .reset_index()
+               .assign(ts_hour=lambda d: d["ts"].dt.floor("h"))
+               .groupby("ts_hour")
+               .agg(
+                   temp         = ("temp", "mean"),
+                   humidity     = ("humidity", "mean"),
+                   clouds       = ("clouds", "mean"),
+                   cloud_bucket = ("cloud_bucket", "max"),
+                   sun_up       = ("sun_up", "max"),
+               )
+               .reset_index()
     )
 
-    merged = solar_hr.merge(wx_hist, on="ts_hour", how="inner").dropna()
-    if len(merged) < 24:                          # at least one day
-        class ZeroModel:                          # always-zero fallback
-            def predict(self, X): return np.zeros(len(X))
-        return ZeroModel()
-
-    # physics feature: clear-sky irradiance W/m²
-    merged["ghi_cs"] = merged["ts_hour"].apply(_clear_sky_wm2)
-
+    merged = solar_hr.merge(wx_hist_agg, on="ts_hour", how="inner").dropna()
     merged["hour"] = merged["ts_hour"].dt.hour
-    X = merged[["temp","humidity","clouds",
-                "cloud_bucket","ghi_cs","hour","sun_up"]]
+    merged["doy"]  = merged["ts_hour"].dt.dayofyear
 
-    # target: log(abs(kwh)); keep sign separate
-    merged["sign"] = np.sign(merged["kwh"])
-    y = np.log1p(np.abs(merged["kwh"]))
+    # ---------- fallback if too little data ---------------------------------
+    if len(merged) < 24:                         # < one day of overlap
+        per_hour_median = (
+            merged.groupby("hour")["kwh"].median()
+                   .reindex(range(24), fill_value=0.0)
+        )
 
-    gbr = GradientBoostingRegressor(
-        n_estimators=400, learning_rate=0.05,
-        max_depth=3, random_state=0
-    ).fit(X, y)
+        class MedianModel:
+            def __init__(self, med):
+                self.med = med.values            # length-24 vector
+            def predict(self, X):
+                out = np.zeros(len(X))
+                hrs = X["hour"].to_numpy()
+                out[:] = -np.abs(self.med[hrs])  # negative = production
+                out[X["sun_up"] == 0] = 0.0      # zero at night
+                return out
 
-    # hourly envelope for cap (120 % best)
-    env = (merged.groupby("hour")["kwh"]
-                .apply(lambda s: s.abs().max()*1.2)
-                .reindex(range(24), fill_value=0)).values
+        return MedianModel(per_hour_median)
+
+    # ---------- robust linear model -----------------------------------------
+    X = merged[["temp", "humidity", "clouds",
+                "cloud_bucket", "hour", "doy", "sun_up"]]
+    y = merged["kwh"]
+
+    huber = HuberRegressor(alpha=0.0001, epsilon=1.5).fit(X, y)
 
     class Wrapper:
-        def __init__(self, core, env): self.core, self.env = core, env
+        def __init__(self, core):
+            self.core = core
         def predict(self, X_df):
-            base = np.expm1(self.core.predict(X_df))   # back-transform
-            base = -base                               # production negative
-            # cap to envelope
-            hour_idx = X_df["hour"].to_numpy()
-            cap = self.env[hour_idx]
-            out = -np.minimum(base, cap)               # keep negative
-            out[X_df["sun_up"]==0] = 0.0               # night = 0
-            return out
+            pred = self.core.predict(
+                X_df[["temp", "humidity", "clouds",
+                      "cloud_bucket", "hour", "doy", "sun_up"]]
+            )
+            pred[X_df["sun_up"] == 0] = 0.0      # force zero at night
+            return pred
 
-    return Wrapper(gbr, env)
+    return Wrapper(huber)
+
 
 
 # ── prediction helpers ───────────────────────────────────────────────────────
