@@ -195,8 +195,13 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
 
 # ── model ────────────────────────────────────────────────────────────────────
+# ── model ────────────────────────────────────────────────────────────────────
 def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
-    # keep only hours where production/consumption ≠ 0
+    """
+    Returns an object with .predict(X_df) -> kWh.
+    If too little data, returns a ZeroModel that always predicts 0.
+    """
+    # ── merge solar & weather ------------------------------------------------
     solar_hr = solar.loc[lambda s: s["kwh"] != 0].reset_index()
     solar_hr["ts_hour"] = solar_hr["ts"].dt.floor("h")
 
@@ -215,64 +220,53 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
     )
 
     merged = solar_hr.merge(wx_hist_agg, on="ts_hour", how="inner").dropna()
-    if len(merged) < 12:         
+
+    # ── guard: if < 12 hourly records → fallback to zero model ---------------
+    if len(merged) < 12:
         class ZeroModel:
-            def predict(self, X):  
+            def predict(self, X):            # keeps API identical
                 return np.zeros(len(X))
-        return ZeroModel()       
+        return ZeroModel()                   # ← INSTANCE, not class
 
-
-    # -------- target: log of absolute production ---------------------------
+    # ── feature engineering --------------------------------------------------
     merged["hour"] = merged["ts_hour"].dt.hour
     merged["doy"]  = merged["ts_hour"].dt.dayofyear
 
     X = merged[["temp", "humidity", "clouds",
                 "cloud_bucket", "hour", "doy", "sun_up"]]
+    y = merged["kwh"]
 
-    y = np.log1p(merged["kwh"].abs())            # log-scaled magnitude
-    sign = np.sign(merged["kwh"].values)         # store sign separately
-
+    # ── train Gradient Boosting ---------------------------------------------
     model = GradientBoostingRegressor(
-        n_estimators=400, learning_rate=0.05, max_depth=3, random_state=0
+        n_estimators=400, learning_rate=0.05,
+        max_depth=3, random_state=0
     ).fit(X, y)
 
-    # we also need historic hour-max for post-cap
-    hist_max = (merged.groupby("hour")["kwh"].apply(lambda s: s.abs().max())
-                         .reindex(range(24), fill_value=0.0) * 1.10)  # +10 %
-
-    # bundle everything in a tiny wrapper -------------------------------------------------
-    class Wrapper:
-        def __init__(self, core, hour_max):       # hour_max is a 24-length Series
-            self.core = core
-            self.hour_max = hour_max.values
-
-        def predict(self, X_df: pd.DataFrame):
-            preds = np.expm1(self.core.predict(X_df))     # back-transform
-            preds *= -1                                   # production is negative
-            # cap to 110 % historic best for that hour
-            hour_col = X_df["hour"].to_numpy()
-            cap = self.hour_max[hour_col]
-            preds = np.clip(preds, -cap, 0.0)
-            # zero at night
-            preds[X]()
+    return model
 
 
 # ── prediction helpers ───────────────────────────────────────────────────────
-def _predict_block(df, model, horizon):
+def _predict_block(df: pd.DataFrame, model, horizon: int):
+    """
+    Predict kWh for the first *horizon* rows of df.
+    Night hours (sun_up == 0) are always clamped to 0 kWh.
+    """
     blk = df.iloc[:horizon].copy()
     blk["hour"] = blk.index.hour
     blk["doy"]  = blk.index.dayofyear
 
     X = blk[["temp", "humidity", "clouds",
-            "cloud_bucket", "hour", "doy", "sun_up"]].ffill()
+             "cloud_bucket", "hour", "doy", "sun_up"]].ffill()
 
-    blk["pred_kwh"] = model.predict(X)            # wrapper handles log/back-cap
+    blk["pred_kwh"] = model.predict(X)
 
-    blk.loc[blk["sun_up"] == 0, "pred_kwh"] = 0.0    # force zero at night
+    # enforce zero production at night
+    blk.loc[blk["sun_up"] == 0, "pred_kwh"] = 0.0
 
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
     blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0
     return blk[["pred_mwh", "timestamp"]].round(4).to_dict("records")
+
 
 
 def make_forecasts(model, wx_hr: pd.DataFrame, wx_dl: pd.DataFrame):
