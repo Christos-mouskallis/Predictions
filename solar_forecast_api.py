@@ -168,15 +168,16 @@ def get_solar_history(days: int = HIST_DAYS) -> pd.DataFrame:
 # ── weather data ─────────────────────────────────────────────────────────────
 def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Returns:
-        wx_hist – 30-day historic hourly  (temp, humidity, clouds, cloud_bucket, sun_up)
-        wx_hr   – next-48 h forecast hourly (same columns)
-        wx_dl   – 16-day daily forecast    (temp, humidity, clouds, sunrise, sunset)
-    Uses only the allowed OpenWeather fields.
+    Returns
+        wx_hist – 30-day historic hourly   (temp, humidity, clouds,
+                                            cloud_bucket, sun_up)
+        wx_hr   – next-48 h hourly fc      (same cols)
+        wx_dl   – 16-day daily forecast    (temp, humidity, clouds,
+                                            sunrise, sunset)
     """
     now = dt.datetime.now(timezone.utc)
 
-    # ---------- 48 h HOURLY forecast ----------------------------------------
+    # ---------- 48 h HOURLY forecast ---------------------------------------
     fc_hr = requests.get(
         HOURLY_FC,
         params=dict(lat=LAT, lon=LON, units="metric", appid=OWM_KEY),
@@ -184,23 +185,27 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     ).json()
 
     wx_hr = (
-        pd.DataFrame(fc_hr["list"])[:48]
-        .assign(
-            ts       = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True),
-            temp     = lambda d: d["main"].apply(lambda m: m["temp"]),
-            humidity = lambda d: d["main"].apply(lambda m: m["humidity"]),
-            clouds   = lambda d: d["clouds"].apply(lambda c: c["all"]),
-            sun_up   = lambda d: d["sys"].apply(
-                lambda s: 1 if s.get("pod", "n") == "d" else 0
-            ) if "sys" in d.columns else d["weather"].apply(
-                lambda w: 1 if w[0]["icon"].endswith("d") else 0
-            ),
-        )
-        .set_index("ts")[["temp", "humidity", "clouds", "sun_up"]]
+        pd.DataFrame(fc_hr["list"])[:48]                       # keep 48 h
+          .assign(
+              ts       = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True),
+              temp     = lambda d: d["main"].apply(lambda m: m["temp"]),
+              humidity = lambda d: d["main"].apply(lambda m: m["humidity"]),
+              clouds   = lambda d: d["clouds"].apply(lambda c: c["all"]),
+              sun_up   = lambda d: (
+                  d["sys"].apply(
+                      lambda s: 1 if s.get("pod", "n") == "d" else 0
+                  ) if "sys" in d.columns
+                  else d["weather"].apply(
+                      lambda w: 1 if w[0]["icon"].endswith("d") else 0
+                  )
+              ),
+          )
+          .set_index("ts")[["temp", "humidity", "clouds", "sun_up"]]
     )
     wx_hr["cloud_bucket"] = wx_hr["clouds"].apply(_cloud_bucket)
+    wx_hr["sun_up"] = wx_hr["sun_up"].fillna(0).astype(int)
 
-    # ---------- 30-day HOURLY history ---------------------------------------
+    # ---------- 30-day HOURLY history --------------------------------------
     hist_rows = []
     for back in range(1, HIST_DAYS + 1):
         day      = now - dt.timedelta(days=back)
@@ -216,6 +221,7 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         )
         for itm in r.json().get("list", []):
             clouds = itm["clouds"]["all"]
+            pod    = itm.get("sys", {}).get("pod")
             hist_rows.append(
                 dict(
                     ts           = _dt_utc(itm["dt"]),
@@ -223,18 +229,18 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                     humidity     = itm["main"]["humidity"],
                     clouds       = clouds,
                     cloud_bucket = _cloud_bucket(clouds),
-                    sun_up       = 1 if itm.get("sys", {}).get("pod", "n") == "d" else 0,
+                    sun_up       = 1 if pod == "d" else 0,
                 )
             )
 
     wx_hist = (
         pd.DataFrame(hist_rows)
-        .set_index("ts")
-        .sort_index()
-        .drop_duplicates()
+          .set_index("ts")
+          .sort_index()
+          .drop_duplicates()
     )
 
-    # ---------- 16-day DAILY forecast (keep sunrise/sunset) -----------------
+    # ---------- 16-day DAILY forecast --------------------------------------
     fc_dl = requests.get(
         DAILY_FC,
         params=dict(lat=LAT, lon=LON, cnt=16, units="metric", appid=OWM_KEY),
@@ -243,15 +249,15 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
     wx_dl = (
         pd.DataFrame(fc_dl["list"])
-        .assign(
-            ts       = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True)
-                                + pd.Timedelta(hours=12),
-            temp     = lambda d: d["temp"].apply(lambda t: t["max"]),
-            humidity = lambda d: d["humidity"],
-            clouds   = lambda d: d["clouds"],
-        )
-        .set_index("ts")[["temp", "humidity", "clouds", "sunrise", "sunset"]]
-        .sort_index()
+          .assign(
+              ts       = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True)
+                                   + pd.Timedelta(hours=12),
+              temp     = lambda d: d["temp"].apply(lambda t: t["max"]),
+              humidity = lambda d: d["humidity"],
+              clouds   = lambda d: d["clouds"],
+          )
+          .set_index("ts")[["temp", "humidity", "clouds", "sunrise", "sunset"]]
+          .sort_index()
     )
 
     return wx_hist, wx_hr, wx_dl
@@ -332,8 +338,12 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
 
 
 # ── prediction helpers ───────────────────────────────────────────────────────
-def _predict_block(df: pd.DataFrame, model, horizon: int,
-                   slope: float = 1.0, intercept: float = 0.0):
+def _predict_block(df: pd.DataFrame,
+                   model,
+                   horizon: int,
+                   *,
+                   slope: float = 1.0,
+                   intercept: float = 0.0):
     blk = df.iloc[:horizon].copy()
     blk["hour"] = blk.index.hour
     blk["doy"]  = blk.index.dayofyear
@@ -350,21 +360,21 @@ def _predict_block(df: pd.DataFrame, model, horizon: int,
 
 
 
+
 def make_forecasts(model,
                    wx_hr: pd.DataFrame,
                    wx_dl: pd.DataFrame,
                    *,
-                   scale: float = 1.0,
-                   slope: float = 1.0,
+                   scale: float   = 1.0,
+                   slope: float   = 1.0,
                    intercept: float = 0.0):
-    """Return hourly list and 7-day daily list."""
-    eff_slope = slope * scale          # merge both corrections
+    eff_slope = slope * scale    # merge both corrections
 
-    # --- 24 × 1 h -----------------------------------------------------------
+    # ----- 24 × 1 h ---------------------------------------------------------
     hourly = _predict_block(wx_hr, model, 24,
                             slope=eff_slope, intercept=intercept)
 
-    # helper – build synthetic 24 h frame from a daily row
+    # helper – expand one daily row into 24 synthetic hours
     def _expand_day(row_ts, row_vals):
         base = row_ts.floor("D")
         idx  = [base + pd.Timedelta(hours=h) for h in range(24)]
@@ -382,11 +392,11 @@ def make_forecasts(model,
             index=idx,
         )
 
-    # --- 7-day horizon ------------------------------------------------------
+    # ----- 7-day horizon ----------------------------------------------------
     daily = []
-    day0_ts  = pd.to_datetime(hourly[0]["timestamp"], unit="s", utc=True).floor("D")
-    day0_val = round(sum(pt["pred_mwh"] for pt in hourly), 4)
-    daily.append({"pred_mwh": day0_val, "timestamp": int(day0_ts.timestamp())})
+    d0_ts  = pd.to_datetime(hourly[0]["timestamp"], unit="s", utc=True).floor("D")
+    d0_val = round(sum(pt["pred_mwh"] for pt in hourly), 4)
+    daily.append({"pred_mwh": d0_val, "timestamp": int(d0_ts.timestamp())})
 
     for ts, row in wx_dl.iloc[1:8].iterrows():          # next 7 days
         synth = _expand_day(ts, row)
@@ -401,7 +411,7 @@ def make_forecasts(model,
 
 
 
-# ── Flask endpoint ───────────────────────────────────────────────────────────
+
 @app.route("/forecast")
 def forecast():
     now = time.time()
@@ -434,6 +444,7 @@ def forecast():
             json.dumps({"error": str(exc)}), status=500,
             mimetype="application/json"
         )
+
 
 
 if __name__ == "__main__":
