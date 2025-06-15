@@ -169,14 +169,13 @@ def get_solar_history(days: int = HIST_DAYS) -> pd.DataFrame:
 def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Returns
-        wx_hist – 30 d historic hourly   (temp, humidity, clouds,
-                                          cloud_bucket, sun_up)
-        wx_hr   – next-48 h hourly fc    (same cols)
-        wx_dl   – 16 d daily forecast    (temp, humidity, clouds,
-                                          sunrise, sunset)
-    All three frames are guaranteed to hold *both*
-        cloud_bucket ∈ {0,1,2,3}   and
-        sun_up       ∈ {0,1}
+        wx_hist – 30-day historic hourly    (temp, humidity, clouds,
+                                             cloud_bucket, sun_up)
+        wx_hr   – next-48 h hourly forecast (same cols)
+        wx_dl   – 16-day daily forecast     (temp, humidity, clouds,
+                                             sunrise, sunset)
+    All three frames GUARANTEE both columns:
+        cloud_bucket ∈ {0,1,2,3}   and   sun_up ∈ {0,1}
     """
     now = dt.datetime.now(timezone.utc)
 
@@ -205,13 +204,13 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
           .set_index("ts")[["temp", "humidity", "clouds", "sun_up"]]
     )
     wx_hr["cloud_bucket"] = wx_hr["clouds"].apply(_cloud_bucket)
-    wx_hr["sun_up"] = wx_hr["sun_up"].fillna(0).astype(int)
+    wx_hr["sun_up"]       = wx_hr["sun_up"].fillna(0).astype(int)
 
     # ── 30 d HOURLY HISTORY ────────────────────────────────────────────────
     hist_rows = []
     for back in range(1, HIST_DAYS + 1):
-        day      = now - dt.timedelta(days=back)
-        start_ts = int(day.replace(hour=0,  minute=0, second=0).timestamp())
+        day = now - dt.timedelta(days=back)
+        start_ts = int(day.replace(hour=0, minute=0, second=0).timestamp())
         end_ts   = int(day.replace(hour=23, minute=59, second=59).timestamp())
 
         r = requests.get(
@@ -223,7 +222,7 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         )
         for itm in r.json().get("list", []):
             clouds = itm["clouds"]["all"]
-            pod    = itm.get("sys", {}).get("pod")
+            pod    = itm.get("sys", {}).get("pod")            # 'd' or 'n'
             hist_rows.append(
                 dict(
                     ts           = _dt_utc(itm["dt"]),
@@ -242,7 +241,7 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
           .drop_duplicates()
     )
 
-    # ── 16 d DAILY FORECAST (keep sunrise / sunset) ────────────────────────
+    # ── 16 d DAILY FORECAST ────────────────────────────────────────────────
     fc_dl = requests.get(
         DAILY_FC,
         params=dict(lat=LAT, lon=LON, cnt=16, units="metric", appid=OWM_KEY),
@@ -271,8 +270,21 @@ from sklearn.linear_model import HuberRegressor
 from numpy import log1p, expm1, clip
 import numpy as np
 
+from sklearn.linear_model import HuberRegressor
+from numpy import log1p, expm1, clip
+import numpy as np
+
 def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
-    """Return an object with `.predict(df)` in kWh (negative = export)."""
+    """Return an object with .predict(df) that outputs kWh (negative = export)."""
+    # ---------- guarantee required weather columns -------------------------
+    for col in ("sun_up", "cloud_bucket"):
+        if col not in wx_hist.columns:
+            if col == "sun_up":
+                wx_hist[col] = 0
+            else:
+                wx_hist[col] = wx_hist["clouds"].apply(_cloud_bucket)
+
+    # ---------- merge solar + weather, fit robust model --------------------
     solar_hr = solar[solar["kwh"] != 0].reset_index()
     solar_hr["ts_hour"] = solar_hr["ts"].dt.floor("h")
 
@@ -297,7 +309,6 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
     # daylight rows for capacity fit
     daylight = merged[merged["sun_up"] == 1].copy()
     if daylight.empty:
-        # fallback – median profile per hour
         med = (merged.groupby("hour")["kwh"].median()
                         .reindex(range(24), fill_value=0.0).abs() * 1.10)
 
@@ -311,9 +322,9 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
 
     daylight["irrad"]  = 1.0 - daylight["clouds"] / 100.0
     daylight["y_norm"] = daylight["kwh"].abs() / daylight["irrad"].clip(lower=0.1)
-    y_cap   = np.log1p(daylight["y_norm"])
-    X_cap   = daylight[["temp", "humidity", "clouds",
-                        "cloud_bucket", "hour", "doy"]]
+    y_cap = np.log1p(daylight["y_norm"])
+    X_cap = daylight[["temp", "humidity", "clouds",
+                      "cloud_bucket", "hour", "doy"]]
 
     huber = HuberRegressor(max_iter=500, epsilon=1.5).fit(X_cap, y_cap)
 
@@ -323,7 +334,7 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
     class Wrapper:
         def __init__(self, core, cap):
             self.core = core
-            self.cap  = cap          # length-24 ndarray
+            self.cap  = cap      # length-24 ndarray
 
         def predict(self, X_df):
             irrad = 1.0 - X_df["clouds"] / 100.0
@@ -332,11 +343,12 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
                           X_df[["temp","humidity","clouds",
                                 "cloud_bucket","hour","doy"]]))
             pred  = -y_hat * irrad
-            pred  = clip(pred, -cap, 0)        # cannot exceed capacity
+            pred  = clip(pred, -cap, 0)
             pred[X_df["sun_up"] == 0] = 0.0
             return pred
 
     return Wrapper(huber, hour_cap)
+
 
 
 # ── prediction helpers ───────────────────────────────────────────────────────
