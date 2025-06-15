@@ -280,10 +280,6 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
 
     huber = HuberRegressor(max_iter=500, epsilon=1.5).fit(X_cap, y)
 
-
-    # hourly physical cap (110 % of best in last 30 days)
-    
-
     class Wrapper:
         def __init__(self, core, cap):
             self.core = core
@@ -303,7 +299,7 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
 
 
 # ── prediction helpers ───────────────────────────────────────────────────────
-def _predict_block(df: pd.DataFrame, model, horizon: int):
+def _predict_block(df: pd.DataFrame, model, horizon: int, slope: float = 1.0, intercept: float = 0.0):
     blk = df.iloc[:horizon].copy()
     blk["hour"] = blk.index.hour
     blk["doy"]  = blk.index.dayofyear
@@ -311,16 +307,16 @@ def _predict_block(df: pd.DataFrame, model, horizon: int):
     X = blk[["temp", "humidity", "clouds",
              "cloud_bucket", "hour", "doy", "sun_up"]].ffill()
 
-    blk["pred_kwh"] = model.predict(X) * scale
-
-    blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
+    blk["pred_kwh"] = model.predict(X) * scale + intercept
     blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0
+    blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
+    
     return blk[["pred_mwh", "timestamp"]].round(4).to_dict("records")
 
 
 
-def make_forecasts(model, wx_hr: pd.DataFrame, wx_dl: pd.DataFrame, scale=1.0):
-    hourly = _predict_block(wx_hr, model, 24)
+def make_forecasts(model, wx_hr: pd.DataFrame, wx_dl: pd.DataFrame, scale=1.0, slope: float = 1.0, intercept: float = 0.0):
+    hourly = _predict_block(wx_hr, model, 24, slope=slope, intercept=intercept)
 
     def _expand_day(row_ts, row_vals):
         """Build a 24-hour synthetic frame for one daily forecast row."""
@@ -354,7 +350,7 @@ def make_forecasts(model, wx_hr: pd.DataFrame, wx_dl: pd.DataFrame, scale=1.0):
 
     for ts, row in wx_dl.iloc[1:8].iterrows():  # Only 7 days instead of 16
         synth_df = _expand_day(ts, row)
-        block = _predict_block(synth_df, model, 24)
+        block = _predict_block(synth_df, model, 24, slope=slope, intercept=intercept)
         day_val = round(sum(pt["pred_mwh"] for pt in block), 4)
         daily_records.append(
             {"pred_mwh": day_val, "timestamp": int(ts.floor("D").timestamp())}
@@ -374,7 +370,9 @@ def forecast():
         solar = get_solar_history()
         wx_hist, wx_hr, wx_dl = get_weather()
         scale = _calibrate_scale(model, solar, wx_hist)
-        hourly, daily_7, daily_16 = make_forecasts(model, wx_hr, wx_dl, scale)
+        model  = train_model(solar, wx_hist)
+        slope, intercept = _calibrate_level(model, solar, wx_hist)
+        hourly, daily_7, daily_16 = make_forecasts(model, wx_hr, wx_dl, scale, slope=slope, intercept=intercept)
 
         payload = {
             "generated_utc": int(now),
