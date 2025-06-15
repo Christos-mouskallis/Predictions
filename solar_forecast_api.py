@@ -169,15 +169,18 @@ def get_solar_history(days: int = HIST_DAYS) -> pd.DataFrame:
 def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Returns
-        wx_hist – 30-day historic hourly   (temp, humidity, clouds,
-                                            cloud_bucket, sun_up)
-        wx_hr   – next-48 h hourly fc      (same cols)
-        wx_dl   – 16-day daily forecast    (temp, humidity, clouds,
-                                            sunrise, sunset)
+        wx_hist – 30 d historic hourly   (temp, humidity, clouds,
+                                          cloud_bucket, sun_up)
+        wx_hr   – next-48 h hourly fc    (same cols)
+        wx_dl   – 16 d daily forecast    (temp, humidity, clouds,
+                                          sunrise, sunset)
+    All three frames are guaranteed to hold *both*
+        cloud_bucket ∈ {0,1,2,3}   and
+        sun_up       ∈ {0,1}
     """
     now = dt.datetime.now(timezone.utc)
 
-    # ---------- 48 h HOURLY forecast ---------------------------------------
+    # ── 48 h HOURLY FORECAST ───────────────────────────────────────────────
     fc_hr = requests.get(
         HOURLY_FC,
         params=dict(lat=LAT, lon=LON, units="metric", appid=OWM_KEY),
@@ -185,16 +188,15 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     ).json()
 
     wx_hr = (
-        pd.DataFrame(fc_hr["list"])[:48]                       # keep 48 h
+        pd.DataFrame(fc_hr["list"])[:48]
           .assign(
               ts       = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True),
               temp     = lambda d: d["main"].apply(lambda m: m["temp"]),
               humidity = lambda d: d["main"].apply(lambda m: m["humidity"]),
               clouds   = lambda d: d["clouds"].apply(lambda c: c["all"]),
               sun_up   = lambda d: (
-                  d["sys"].apply(
-                      lambda s: 1 if s.get("pod", "n") == "d" else 0
-                  ) if "sys" in d.columns
+                  d["sys"].apply(lambda s: 1 if s.get("pod", "n") == "d" else 0)
+                  if "sys" in d.columns
                   else d["weather"].apply(
                       lambda w: 1 if w[0]["icon"].endswith("d") else 0
                   )
@@ -205,7 +207,7 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     wx_hr["cloud_bucket"] = wx_hr["clouds"].apply(_cloud_bucket)
     wx_hr["sun_up"] = wx_hr["sun_up"].fillna(0).astype(int)
 
-    # ---------- 30-day HOURLY history --------------------------------------
+    # ── 30 d HOURLY HISTORY ────────────────────────────────────────────────
     hist_rows = []
     for back in range(1, HIST_DAYS + 1):
         day      = now - dt.timedelta(days=back)
@@ -240,7 +242,7 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
           .drop_duplicates()
     )
 
-    # ---------- 16-day DAILY forecast --------------------------------------
+    # ── 16 d DAILY FORECAST (keep sunrise / sunset) ────────────────────────
     fc_dl = requests.get(
         DAILY_FC,
         params=dict(lat=LAT, lon=LON, cnt=16, units="metric", appid=OWM_KEY),
@@ -344,7 +346,19 @@ def _predict_block(df: pd.DataFrame,
                    *,
                    slope: float = 1.0,
                    intercept: float = 0.0):
+    """
+    Take the first *horizon* rows of *df*, fill any missing weather columns,
+    call model.predict() → kWh, apply (slope, intercept) post-correction,
+    return a list of {"pred_mwh", "timestamp"} dicts.
+    """
     blk = df.iloc[:horizon].copy()
+
+    # --- guarantee required columns ---------------------------------------
+    if "sun_up" not in blk:
+        blk["sun_up"] = 0
+    if "cloud_bucket" not in blk:
+        blk["cloud_bucket"] = blk["clouds"].apply(_cloud_bucket)
+
     blk["hour"] = blk.index.hour
     blk["doy"]  = blk.index.dayofyear
 
@@ -356,6 +370,7 @@ def _predict_block(df: pd.DataFrame,
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
 
     return blk[["pred_mwh", "timestamp"]].round(4).to_dict("records")
+
 
 
 
