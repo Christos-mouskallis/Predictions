@@ -307,7 +307,7 @@ def _predict_block(df: pd.DataFrame, model, horizon: int, slope: float = 1.0, in
     X = blk[["temp", "humidity", "clouds",
              "cloud_bucket", "hour", "doy", "sun_up"]].ffill()
 
-    blk["pred_kwh"] = model.predict(X) * scale + intercept
+    blk["pred_kwh"] = model.predict(X) * slope + intercept
     blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
     
@@ -369,10 +369,10 @@ def forecast():
     try:
         solar = get_solar_history()
         wx_hist, wx_hr, wx_dl = get_weather()
-        scale = _calibrate_scale(model, solar, wx_hist)
         model  = train_model(solar, wx_hist)
+        scale = _calibrate_scale(model, solar, wx_hist)
         slope, intercept = _calibrate_level(model, solar, wx_hist)
-        hourly, daily_7, daily_16 = make_forecasts(model, wx_hr, wx_dl, scale, slope=slope, intercept=intercept)
+        hourly, daily_7, daily_16 = make_forecasts(model, wx_hr, wx_dl, scale=scale, slope=slope, intercept=intercept)
 
         payload = {
             "generated_utc": int(now),
