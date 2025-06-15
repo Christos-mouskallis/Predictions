@@ -348,40 +348,55 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
             return pred
 
     return Wrapper(huber, hour_cap)
-
-
-
-# ── prediction helpers ───────────────────────────────────────────────────────
-def _predict_block(df: pd.DataFrame,
-                   model,
-                   horizon: int,
-                   *,
-                   slope: float = 1.0,
-                   intercept: float = 0.0):
+# ────────────────────────────────────────────────────────────────────────────
+def _predict_block(
+        df: pd.DataFrame,
+        model,
+        horizon: int,
+        *,
+        slope: float = 1.0,
+        intercept: float = 0.0,
+):
     """
-    Take the first *horizon* rows of *df*, fill any missing weather columns,
-    call model.predict() → kWh, apply (slope, intercept) post-correction,
-    return a list of {"pred_mwh", "timestamp"} dicts.
+    • Takes the first *horizon* rows of *df*.
+    • Ensures *all required columns* exist, creating safe defaults when missing.
+    • Runs model → kWh, applies (slope, intercept) post-correction.
+    • Returns [{"pred_mwh", "timestamp"}, …].
     """
     blk = df.iloc[:horizon].copy()
 
-    # --- guarantee required columns ---------------------------------------
-    if "sun_up" not in blk:
-        blk["sun_up"] = 0
-    if "cloud_bucket" not in blk:
-        blk["cloud_bucket"] = blk["clouds"].apply(_cloud_bucket)
+    # ---------- harden every expected column -------------------------------
+    defaults = {
+        "temp":         15.0,
+        "humidity":     70.0,
+        "clouds":       50.0,
+        "cloud_bucket": 2,
+        "sun_up":       0,
+    }
+    for col, default in defaults.items():
+        if col not in blk:
+            blk[col] = default
 
+    # cloud_bucket can be re-derived safely
+    blk["cloud_bucket"] = blk["clouds"].apply(_cloud_bucket)
+
+    # time features
+    blk.index = pd.to_datetime(blk.index, utc=True)
     blk["hour"] = blk.index.hour
     blk["doy"]  = blk.index.dayofyear
 
+    # ------------------ model → kWh ----------------------------------------
     X = blk[["temp", "humidity", "clouds",
-             "cloud_bucket", "hour", "doy", "sun_up"]].ffill()
-
+             "cloud_bucket", "hour", "doy", "sun_up"]]
     blk["pred_kwh"] = model.predict(X) * slope + intercept
-    blk["pred_mwh"] = blk["pred_kwh"] / 1000.0
+
+    # kWh → MWh for the API
+    blk["pred_mwh"] = blk["pred_kwh"] / 1_000.0
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
 
     return blk[["pred_mwh", "timestamp"]].round(4).to_dict("records")
+# ────────────────────────────────────────────────────────────────────────────
+
 
 
 
