@@ -70,28 +70,28 @@ def _cloud_bucket(pct: float) -> int:
 # ── helpers ────────────────────────────────────────────────────────────────
 def _calibrate_scale(model, solar_df, wx_hist) -> float:
     """
-    Compare model output with the most-recent 48 h that have BOTH weather
-    + meter data and return a multiplicative scale.
+    Compare model output with the last 48 h that have BOTH weather + meter
+    data and return a multiplicative scale (clipped to 0.5–10×).
     """
     recent_wx = (
         wx_hist.tail(48)
-               .reset_index()                               # ts as a column
+               .reset_index()                       # “ts” becomes a column
                .assign(ts=lambda d: d["ts"].dt.floor("h"))
     )
-
     recent_sol = (
         solar_df.reset_index()[["ts", "kwh"]]
                  .groupby("ts", as_index=False).sum()
     )
-
     merged = recent_wx.merge(recent_sol, on="ts", how="inner").dropna()
     if merged.empty:
         return 1.0
 
     merged["hour"] = merged["ts"].dt.hour
     merged["doy"]  = merged["ts"].dt.dayofyear
+    merged["sun_up"] = (merged["hour"].between(6, 18)).astype(int)  # ← NEW
+
     X = merged[["temp", "humidity", "clouds",
-                "cloud_bucket", "hour", "doy"]]
+                "cloud_bucket", "hour", "doy", "sun_up"]]
 
     preds = model.predict(X)
     good  = np.abs(preds) > 1e-3
@@ -101,11 +101,12 @@ def _calibrate_scale(model, solar_df, wx_hist) -> float:
     ratio = np.abs(merged.loc[good, "kwh"]) / np.abs(preds[good])
     return float(np.clip(np.median(ratio), 0.5, 10.0))
 
+
 def _calibrate_level(model, solar_df, wx_hist, min_kw_cutoff=500):
     """
-    Robust one-day linear correction:
+    Robust 72 h linear correction:
         y_real ≈ slope · y_pred + intercept
-    Only “daylight” rows (|kWh| > min_kw_cutoff) are used.
+    Uses only rows with |kWh| > min_kw_cutoff (day-light).
     """
     recent_wx = (
         wx_hist.tail(72)
@@ -122,8 +123,10 @@ def _calibrate_level(model, solar_df, wx_hist, min_kw_cutoff=500):
 
     merged["hour"] = merged["ts"].dt.hour
     merged["doy"]  = merged["ts"].dt.dayofyear
+    merged["sun_up"] = (merged["hour"].between(6, 18)).astype(int)  # ← NEW
+
     X = merged[["temp", "humidity", "clouds",
-                "cloud_bucket", "hour", "doy"]]
+                "cloud_bucket", "hour", "doy", "sun_up"]]
 
     preds = model.predict(X)
     mask  = np.abs(merged["kwh"]) > min_kw_cutoff
@@ -135,6 +138,7 @@ def _calibrate_level(model, solar_df, wx_hist, min_kw_cutoff=500):
     slope = float(np.clip(np.median(y / np.where(x == 0, np.nan, x)), 0.2, 5.0))
     intercept = float(np.median(y - slope * x))
     return slope, intercept
+
 
 
 # ── solar data ───────────────────────────────────────────────────────────────
