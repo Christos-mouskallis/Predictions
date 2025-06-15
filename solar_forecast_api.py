@@ -70,37 +70,71 @@ def _cloud_bucket(pct: float) -> int:
 # ── helpers ────────────────────────────────────────────────────────────────
 def _calibrate_scale(model, solar_df, wx_hist) -> float:
     """
-    Compare the model output with the *most recent* 48 h where we have
-    both solar readings and weather.  Return a multiplicative scale that
-    brings the two into line.  Clipped to [0.5 … 10] for safety.
+    Compare model output with the most-recent 48 h that have BOTH weather
+    + meter data and return a multiplicative scale.
     """
-    # intersect the two datasets on the same hourly timestamps
-    recent_wx = wx_hist.tail(48).copy()
-    if recent_wx.empty:
+    recent_wx = (
+        wx_hist.tail(48)
+               .reset_index()                               # ts as a column
+               .assign(ts=lambda d: d["ts"].dt.floor("H"))
+    )
+
+    recent_sol = (
+        solar_df.reset_index()[["ts", "kwh"]]
+                 .groupby("ts", as_index=False).sum()
+    )
+
+    merged = recent_wx.merge(recent_sol, on="ts", how="inner").dropna()
+    if merged.empty:
         return 1.0
 
-    recent_wx["ts"] = recent_wx.index.floor("H")
+    merged["hour"] = merged["ts"].dt.hour
+    merged["doy"]  = merged["ts"].dt.dayofyear
+    X = merged[["temp", "humidity", "clouds",
+                "cloud_bucket", "hour", "doy"]]
+
+    preds = model.predict(X)
+    good  = np.abs(preds) > 1e-3
+    if not good.any():
+        return 1.0
+
+    ratio = np.abs(merged.loc[good, "kwh"]) / np.abs(preds[good])
+    return float(np.clip(np.median(ratio), 0.5, 10.0))
+
+def _calibrate_level(model, solar_df, wx_hist, min_kw_cutoff=500):
+    """
+    Robust one-day linear correction:
+        y_real ≈ slope · y_pred + intercept
+    Only “daylight” rows (|kWh| > min_kw_cutoff) are used.
+    """
+    recent_wx = (
+        wx_hist.tail(72)
+               .reset_index()
+               .assign(ts=lambda d: d["ts"].dt.floor("H"))
+    )
     recent_sol = (
         solar_df.reset_index()[["ts", "kwh"]]
                  .groupby("ts", as_index=False).sum()
     )
     merged = recent_wx.merge(recent_sol, on="ts", how="inner").dropna()
     if merged.empty:
-        return 1.0
+        return 1.0, 0.0
 
-    # build feature matrix exactly like in _predict_block
     merged["hour"] = merged["ts"].dt.hour
     merged["doy"]  = merged["ts"].dt.dayofyear
-    X = merged[["temp", "clouds", "humidity", "hour", "doy"]]
+    X = merged[["temp", "humidity", "clouds",
+                "cloud_bucket", "hour", "doy"]]
 
     preds = model.predict(X)
-    good  = np.abs(preds) > 1e-3          # avoid divide-by-zero
-    if not good.any():
-        return 1.0
+    mask  = np.abs(merged["kwh"]) > min_kw_cutoff
+    if not mask.any():
+        return 1.0, 0.0
 
-    ratio = np.abs(merged.loc[good, "kwh"]) / np.abs(preds[good])
-    scale = float(np.median(ratio))
-    return float(np.clip(scale, 0.5, 10.0))
+    y = merged.loc[mask, "kwh"].to_numpy()
+    x = preds[mask]
+    slope = float(np.clip(np.median(y / np.where(x == 0, np.nan, x)), 0.2, 5.0))
+    intercept = float(np.median(y - slope * x))
+    return slope, intercept
 
 
 # ── solar data ───────────────────────────────────────────────────────────────
@@ -226,10 +260,11 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 # ── model ────────────────────────────────────────────────────────────────────
 # ── model ────────────────────────────────────────────────────────────────────
 from sklearn.linear_model import HuberRegressor
-from numpy import log1p, expm1, clip, zeros
+from numpy import log1p, expm1, clip
+import numpy as np
 
 def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
-    """Return a robust production model; always returns an object with .predict(df)."""
+    """Return an object with `.predict(df)` in kWh (negative = export)."""
     solar_hr = solar[solar["kwh"] != 0].reset_index()
     solar_hr["ts_hour"] = solar_hr["ts"].dt.floor("h")
 
@@ -250,17 +285,13 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
     merged = solar_hr.merge(wx_hist_agg, on="ts_hour", how="inner").dropna()
     merged["hour"] = merged["ts_hour"].dt.hour
     merged["doy"]  = merged["ts_hour"].dt.dayofyear
-    merged["irrad"]= 1.0 - merged["clouds"] / 100.0
 
     # daylight rows for capacity fit
     daylight = merged[merged["sun_up"] == 1].copy()
-
-    # -------- guard: if no daylight rows, use median fallback ---------------
     if daylight.empty:
-        per_hour_median = (
-            merged.groupby("hour")["kwh"].median()
-                   .reindex(range(24), fill_value=0.0).abs() * 1.10
-        )
+        # fallback – median profile per hour
+        med = (merged.groupby("hour")["kwh"].median()
+                        .reindex(range(24), fill_value=0.0).abs() * 1.10)
 
         class MedianModel:
             def __init__(self, med): self.med = med.values
@@ -268,30 +299,32 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
                 out = -self.med[X["hour"].to_numpy()] * (1 - X["clouds"]/100)
                 out[X["sun_up"] == 0] = 0.0
                 return out
+        return MedianModel(med)
 
-        return MedianModel(per_hour_median)
-
-    # -------- robust capacity fit ------------------------------------------
-    daylight["irrad"] = 1.0 - daylight["clouds"] / 100.0
+    daylight["irrad"]  = 1.0 - daylight["clouds"] / 100.0
     daylight["y_norm"] = daylight["kwh"].abs() / daylight["irrad"].clip(lower=0.1)
-    y = np.log1p(daylight["y_norm"])
-    X_cap = daylight[["temp", "humidity", "clouds",
-                      "cloud_bucket", "hour", "doy"]]
+    y_cap   = np.log1p(daylight["y_norm"])
+    X_cap   = daylight[["temp", "humidity", "clouds",
+                        "cloud_bucket", "hour", "doy"]]
 
-    huber = HuberRegressor(max_iter=500, epsilon=1.5).fit(X_cap, y)
+    huber = HuberRegressor(max_iter=500, epsilon=1.5).fit(X_cap, y_cap)
+
+    hour_cap = (daylight.groupby("hour")["kwh"].quantile(0.95)
+                          .reindex(range(24), fill_value=0.0).abs().to_numpy())
 
     class Wrapper:
         def __init__(self, core, cap):
             self.core = core
-            self.cap  = cap        # length-24 numpy
+            self.cap  = cap          # length-24 ndarray
 
         def predict(self, X_df):
             irrad = 1.0 - X_df["clouds"] / 100.0
             cap   = self.cap[X_df["hour"].to_numpy()]
             y_hat = expm1(self.core.predict(
-                          X_df[["temp","humidity","clouds","cloud_bucket","hour","doy"]]))
-            pred  = -y_hat * irrad       # negative = export
-            pred  = clip(pred, -cap, 0)  # never exceed cap
+                          X_df[["temp","humidity","clouds",
+                                "cloud_bucket","hour","doy"]]))
+            pred  = -y_hat * irrad
+            pred  = clip(pred, -cap, 0)        # cannot exceed capacity
             pred[X_df["sun_up"] == 0] = 0.0
             return pred
 
@@ -299,7 +332,8 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
 
 
 # ── prediction helpers ───────────────────────────────────────────────────────
-def _predict_block(df: pd.DataFrame, model, horizon: int, slope: float = 1.0, intercept: float = 0.0):
+def _predict_block(df: pd.DataFrame, model, horizon: int,
+                   slope: float = 1.0, intercept: float = 0.0):
     blk = df.iloc[:horizon].copy()
     blk["hour"] = blk.index.hour
     blk["doy"]  = blk.index.dayofyear
@@ -308,55 +342,63 @@ def _predict_block(df: pd.DataFrame, model, horizon: int, slope: float = 1.0, in
              "cloud_bucket", "hour", "doy", "sun_up"]].ffill()
 
     blk["pred_kwh"] = model.predict(X) * slope + intercept
-    blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0
+    blk["pred_mwh"] = blk["pred_kwh"] / 1000.0
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
-    
+
     return blk[["pred_mwh", "timestamp"]].round(4).to_dict("records")
 
 
 
-def make_forecasts(model, wx_hr: pd.DataFrame, wx_dl: pd.DataFrame, scale=1.0, slope: float = 1.0, intercept: float = 0.0):
-    hourly = _predict_block(wx_hr, model, 24, slope=slope, intercept=intercept)
 
+def make_forecasts(model,
+                   wx_hr: pd.DataFrame,
+                   wx_dl: pd.DataFrame,
+                   *,
+                   scale: float = 1.0,
+                   slope: float = 1.0,
+                   intercept: float = 0.0):
+    """Return hourly list and 7-day daily list."""
+    eff_slope = slope * scale          # merge both corrections
+
+    # --- 24 × 1 h -----------------------------------------------------------
+    hourly = _predict_block(wx_hr, model, 24,
+                            slope=eff_slope, intercept=intercept)
+
+    # helper – build synthetic 24 h frame from a daily row
     def _expand_day(row_ts, row_vals):
-        """Build a 24-hour synthetic frame for one daily forecast row."""
-        base       = row_ts.floor("D")
-        sunrise_s  = row_vals["sunrise"]
-        sunset_s   = row_vals["sunset"]
-        clouds_pct = row_vals["clouds"]
-        temp_val   = row_vals["temp"]
-        hum_val    = row_vals["humidity"]
-    
-        idx = [base + pd.Timedelta(hours=h) for h in range(24)]
-    
+        base = row_ts.floor("D")
+        idx  = [base + pd.Timedelta(hours=h) for h in range(24)]
         return pd.DataFrame(
             {
-                "temp":         temp_val,
-                "humidity":     hum_val,
-                "clouds":       clouds_pct,
-                "cloud_bucket": _cloud_bucket(clouds_pct),
+                "temp":         row_vals["temp"],
+                "humidity":     row_vals["humidity"],
+                "clouds":       row_vals["clouds"],
+                "cloud_bucket": _cloud_bucket(row_vals["clouds"]),
                 "sun_up": [
-                    1 if sunrise_s <= t.timestamp() <= sunset_s else 0
+                    1 if row_vals["sunrise"] <= t.timestamp() <= row_vals["sunset"] else 0
                     for t in idx
                 ],
             },
             index=idx,
         )
 
-    daily_records = []
-    day0_ts = pd.to_datetime(hourly[0]["timestamp"], unit="s", utc=True).floor("D")
+    # --- 7-day horizon ------------------------------------------------------
+    daily = []
+    day0_ts  = pd.to_datetime(hourly[0]["timestamp"], unit="s", utc=True).floor("D")
     day0_val = round(sum(pt["pred_mwh"] for pt in hourly), 4)
-    daily_records.append({"pred_mwh": day0_val, "timestamp": int(day0_ts.timestamp())})
+    daily.append({"pred_mwh": day0_val, "timestamp": int(day0_ts.timestamp())})
 
-    for ts, row in wx_dl.iloc[1:8].iterrows():  # Only 7 days instead of 16
-        synth_df = _expand_day(ts, row)
-        block = _predict_block(synth_df, model, 24, slope=slope, intercept=intercept)
-        day_val = round(sum(pt["pred_mwh"] for pt in block), 4)
-        daily_records.append(
-            {"pred_mwh": day_val, "timestamp": int(ts.floor("D").timestamp())}
-        )
+    for ts, row in wx_dl.iloc[1:8].iterrows():          # next 7 days
+        synth = _expand_day(ts, row)
+        block = _predict_block(synth, model, 24,
+                               slope=eff_slope, intercept=intercept)
+        daily.append({
+            "pred_mwh": round(sum(pt["pred_mwh"] for pt in block), 4),
+            "timestamp": int(ts.floor("D").timestamp())
+        })
 
-    return hourly, daily_records  # ← Only return these
+    return hourly, daily
+
 
 
 # ── Flask endpoint ───────────────────────────────────────────────────────────
@@ -367,12 +409,17 @@ def forecast():
         return jsonify(_cache["payload"])
 
     try:
-        solar = get_solar_history()
+        solar                 = get_solar_history()
         wx_hist, wx_hr, wx_dl = get_weather()
+
         model  = train_model(solar, wx_hist)
-        scale = _calibrate_scale(model, solar, wx_hist)
+        scale  = _calibrate_scale(model, solar, wx_hist)
         slope, intercept = _calibrate_level(model, solar, wx_hist)
-        hourly, daily_7, daily_16 = make_forecasts(model, wx_hr, wx_dl, scale=scale, slope=slope, intercept=intercept)
+
+        hourly, daily_7 = make_forecasts(
+            model, wx_hr, wx_dl,
+            scale=scale, slope=slope, intercept=intercept
+        )
 
         payload = {
             "generated_utc": int(now),
@@ -384,8 +431,10 @@ def forecast():
 
     except Exception as exc:
         return Response(
-            json.dumps({"error": str(exc)}), status=500, mimetype="application/json"
+            json.dumps({"error": str(exc)}), status=500,
+            mimetype="application/json"
         )
+
 
 if __name__ == "__main__":
     print("→  http://localhost:8000/forecast")
