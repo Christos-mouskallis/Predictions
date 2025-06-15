@@ -76,7 +76,7 @@ def _calibrate_scale(model, solar_df, wx_hist) -> float:
     recent_wx = (
         wx_hist.tail(48)
                .reset_index()                               # ts as a column
-               .assign(ts=lambda d: d["ts"].dt.floor("H"))
+               .assign(ts=lambda d: d["ts"].dt.floor("h"))
     )
 
     recent_sol = (
@@ -110,7 +110,7 @@ def _calibrate_level(model, solar_df, wx_hist, min_kw_cutoff=500):
     recent_wx = (
         wx_hist.tail(72)
                .reset_index()
-               .assign(ts=lambda d: d["ts"].dt.floor("H"))
+               .assign(ts=lambda d: d["ts"].dt.floor("h"))
     )
     recent_sol = (
         solar_df.reset_index()[["ts", "kwh"]]
@@ -396,12 +396,6 @@ def _predict_block(
 
     return blk[["pred_mwh", "timestamp"]].round(4).to_dict("records")
 # ────────────────────────────────────────────────────────────────────────────
-
-
-
-
-
-
 
 def make_forecasts(model,
                    wx_hr: pd.DataFrame,
