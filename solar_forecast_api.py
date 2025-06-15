@@ -67,6 +67,42 @@ def _cloud_bucket(pct: float) -> int:
     if pct < 80:   return 2
     return 3
 
+# ── helpers ────────────────────────────────────────────────────────────────
+def _calibrate_scale(model, solar_df, wx_hist) -> float:
+    """
+    Compare the model output with the *most recent* 48 h where we have
+    both solar readings and weather.  Return a multiplicative scale that
+    brings the two into line.  Clipped to [0.5 … 10] for safety.
+    """
+    # intersect the two datasets on the same hourly timestamps
+    recent_wx = wx_hist.tail(48).copy()
+    if recent_wx.empty:
+        return 1.0
+
+    recent_wx["ts"] = recent_wx.index.floor("H")
+    recent_sol = (
+        solar_df.reset_index()[["ts", "kwh"]]
+                 .groupby("ts", as_index=False).sum()
+    )
+    merged = recent_wx.merge(recent_sol, on="ts", how="inner").dropna()
+    if merged.empty:
+        return 1.0
+
+    # build feature matrix exactly like in _predict_block
+    merged["hour"] = merged["ts"].dt.hour
+    merged["doy"]  = merged["ts"].dt.dayofyear
+    X = merged[["temp", "clouds", "humidity", "hour", "doy"]]
+
+    preds = model.predict(X)
+    good  = np.abs(preds) > 1e-3          # avoid divide-by-zero
+    if not good.any():
+        return 1.0
+
+    ratio = np.abs(merged.loc[good, "kwh"]) / np.abs(preds[good])
+    scale = float(np.median(ratio))
+    return float(np.clip(scale, 0.5, 10.0))
+
+
 # ── solar data ───────────────────────────────────────────────────────────────
 def get_solar_history(days: int = HIST_DAYS) -> pd.DataFrame:
     now   = dt.datetime.now(timezone.utc)
@@ -275,7 +311,7 @@ def _predict_block(df: pd.DataFrame, model, horizon: int):
     X = blk[["temp", "humidity", "clouds",
              "cloud_bucket", "hour", "doy", "sun_up"]].ffill()
 
-    blk["pred_kwh"] = model.predict(X)
+    blk["pred_kwh"] = model.predict(X) * scale
 
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
     blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0
@@ -283,7 +319,7 @@ def _predict_block(df: pd.DataFrame, model, horizon: int):
 
 
 
-def make_forecasts(model, wx_hr: pd.DataFrame, wx_dl: pd.DataFrame):
+def make_forecasts(model, wx_hr: pd.DataFrame, wx_dl: pd.DataFrame, scale=1.0):
     hourly = _predict_block(wx_hr, model, 24)
 
     def _expand_day(row_ts, row_vals):
@@ -337,8 +373,8 @@ def forecast():
     try:
         solar = get_solar_history()
         wx_hist, wx_hr, wx_dl = get_weather()
-        model = train_model(solar, wx_hist)
-        hourly, daily_7 = make_forecasts(model, wx_hr, wx_dl)
+        scale = _calibrate_scale(model, solar, wx_hist)
+        hourly, daily_7, daily_16 = make_forecasts(model, wx_hr, wx_dl, scale)
 
         payload = {
             "generated_utc": int(now),
