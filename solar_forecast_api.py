@@ -98,8 +98,9 @@ def _calibrate_scale(model, solar_df, wx_hist) -> float:
     if not good.any():
         return 1.0
 
-    ratio = np.abs(merged.loc[good, "kwh"]) / np.abs(preds[good])
-    return float(np.clip(np.median(ratio), 0.5, 10.0))
+   ratio = np.abs(merged.loc[good, "kwh"]) / np.abs(preds[good])
+    scale = _safe_median(ratio, 1.0)
+    return float(np.clip(scale, 0.5, 10.0))
 
 
 def _calibrate_level(model, solar_df, wx_hist, min_kw_cutoff=5_000):
@@ -135,10 +136,17 @@ def _calibrate_level(model, solar_df, wx_hist, min_kw_cutoff=5_000):
 
     y = merged.loc[mask, "kwh"].to_numpy()
     x = preds[mask]
-    slope = float(np.clip(np.median(y / np.where(x == 0, np.nan, x)), 0.2, 5.0))
-    intercept = float(np.median(y - slope * x))
-    return slope, intercept
+    ratio = y / np.where(x == 0, np.nan, x)
+    slope = float(np.clip(_safe_median(ratio, 1.0), 0.2, 5.0))
+    intercept = _safe_median(y - slope * x, 0.0)
+     return slope, intercept
 
+
+def _safe_median(arr, default):
+    """Return median of finite values; fall back to *default* if none."""
+    arr = np.asarray(arr, float)
+    good = np.isfinite(arr)
+    return float(np.median(arr[good])) if good.any() else default
 
 
 # ── solar data ───────────────────────────────────────────────────────────────
@@ -392,6 +400,8 @@ def _predict_block(
     # ------------------ model → kWh ----------------------------------------
     X = blk[["temp", "humidity", "clouds",
              "cloud_bucket", "hour", "doy", "sun_up"]]
+    if not np.isfinite(slope):     slope = 1.0
+    if not np.isfinite(intercept): intercept = 0.0
     blk["pred_kwh"] = model.predict(X) * slope + intercept
     if hasattr(model, "cap"):
         cap_arr = model.cap[blk["hour"].to_numpy()]        # kWh limits (positive)
