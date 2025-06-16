@@ -102,7 +102,7 @@ def _calibrate_scale(model, solar_df, wx_hist) -> float:
     return float(np.clip(np.median(ratio), 0.5, 10.0))
 
 
-def _calibrate_level(model, solar_df, wx_hist, min_kw_cutoff=500):
+def _calibrate_level(model, solar_df, wx_hist, min_kw_cutoff=5_000):
     """
     Robust 72 h linear correction:
         y_real ≈ slope · y_pred + intercept
@@ -158,7 +158,7 @@ def get_solar_history(days: int = HIST_DAYS) -> pd.DataFrame:
       .assign(
         ts  = lambda d: _dt_utc(d["ts"]),
 
-        kwh = lambda d: pd.to_numeric(d["kwh"], errors="coerce") / 1000.0,
+        kwh = lambda d: pd.to_numeric(d["kwh"], errors="coerce"),
         )
       .dropna(subset=["ts", "kwh"])
       .set_index("ts")
