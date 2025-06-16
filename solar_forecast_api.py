@@ -67,88 +67,6 @@ def _cloud_bucket(pct: float) -> int:
     if pct < 80:   return 2
     return 3
 
-# ── helpers ────────────────────────────────────────────────────────────────
-def _calibrate_scale(model, solar_df, wx_hist) -> float:
-    """
-    Compare model output with the last 48 h that have BOTH weather + meter
-    data and return a multiplicative scale (clipped to 0.5–10×).
-    """
-    recent_wx = (
-        wx_hist.tail(48)
-               .reset_index()                       # “ts” becomes a column
-               .assign(ts=lambda d: d["ts"].dt.floor("h"))
-    )
-    recent_sol = (
-        solar_df.reset_index()[["ts", "kwh"]]
-                 .groupby("ts", as_index=False).sum()
-    )
-    merged = recent_wx.merge(recent_sol, on="ts", how="inner").dropna()
-    if merged.empty:
-        return 1.0
-
-    merged["hour"] = merged["ts"].dt.hour
-    merged["doy"]  = merged["ts"].dt.dayofyear
-    merged["sun_up"] = (merged["hour"].between(6, 18)).astype(int)  # ← NEW
-
-    X = merged[["temp", "humidity", "clouds",
-                "cloud_bucket", "hour", "doy", "sun_up"]]
-
-    preds = model.predict(X)
-    good  = np.abs(preds) > 1e-3
-    if not good.any():
-        return 1.0
-
-   ratio = np.abs(merged.loc[good, "kwh"]) / np.abs(preds[good])
-    scale = _safe_median(ratio, 1.0)
-    return float(np.clip(scale, 0.5, 10.0))
-
-
-def _calibrate_level(model, solar_df, wx_hist, min_kw_cutoff=5_000):
-    """
-    Robust 72 h linear correction:
-        y_real ≈ slope · y_pred + intercept
-    Uses only rows with |kWh| > min_kw_cutoff (day-light).
-    """
-    recent_wx = (
-        wx_hist.tail(72)
-               .reset_index()
-               .assign(ts=lambda d: d["ts"].dt.floor("h"))
-    )
-    recent_sol = (
-        solar_df.reset_index()[["ts", "kwh"]]
-                 .groupby("ts", as_index=False).sum()
-    )
-    merged = recent_wx.merge(recent_sol, on="ts", how="inner").dropna()
-    if merged.empty:
-        return 1.0, 0.0
-
-    merged["hour"] = merged["ts"].dt.hour
-    merged["doy"]  = merged["ts"].dt.dayofyear
-    merged["sun_up"] = (merged["hour"].between(6, 18)).astype(int)  # ← NEW
-
-    X = merged[["temp", "humidity", "clouds",
-                "cloud_bucket", "hour", "doy", "sun_up"]]
-
-    preds = model.predict(X)
-    mask  = np.abs(merged["kwh"]) > min_kw_cutoff
-    if not mask.any():
-        return 1.0, 0.0
-
-    y = merged.loc[mask, "kwh"].to_numpy()
-    x = preds[mask]
-    ratio = y / np.where(x == 0, np.nan, x)
-    slope = float(np.clip(_safe_median(ratio, 1.0), 0.2, 5.0))
-    intercept = _safe_median(y - slope * x, 0.0)
-     return slope, intercept
-
-
-def _safe_median(arr, default):
-    """Return median of finite values; fall back to *default* if none."""
-    arr = np.asarray(arr, float)
-    good = np.isfinite(arr)
-    return float(np.median(arr[good])) if good.any() else default
-
-
 # ── solar data ───────────────────────────────────────────────────────────────
 def get_solar_history(days: int = HIST_DAYS) -> pd.DataFrame:
     now   = dt.datetime.now(timezone.utc)
@@ -166,7 +84,7 @@ def get_solar_history(days: int = HIST_DAYS) -> pd.DataFrame:
       .assign(
         ts  = lambda d: _dt_utc(d["ts"]),
 
-        kwh = lambda d: pd.to_numeric(d["kwh"], errors="coerce"),
+        kwh = lambda d: pd.to_numeric(d["kwh"], errors="coerce") / 1000.0,
         )
       .dropna(subset=["ts", "kwh"])
       .set_index("ts")
@@ -180,18 +98,15 @@ def get_solar_history(days: int = HIST_DAYS) -> pd.DataFrame:
 # ── weather data ─────────────────────────────────────────────────────────────
 def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Returns
-        wx_hist – 30-day historic hourly    (temp, humidity, clouds,
-                                             cloud_bucket, sun_up)
-        wx_hr   – next-48 h hourly forecast (same cols)
-        wx_dl   – 16-day daily forecast     (temp, humidity, clouds,
-                                             sunrise, sunset)
-    All three frames GUARANTEE both columns:
-        cloud_bucket ∈ {0,1,2,3}   and   sun_up ∈ {0,1}
+    Returns:
+        wx_hist – 30-day historic hourly  (temp, humidity, clouds, cloud_bucket, sun_up)
+        wx_hr   – next-48 h forecast hourly (same columns)
+        wx_dl   – 16-day daily forecast    (temp, humidity, clouds, sunrise, sunset)
+    Uses only the allowed OpenWeather fields.
     """
     now = dt.datetime.now(timezone.utc)
 
-    # ── 48 h HOURLY FORECAST ───────────────────────────────────────────────
+    # ---------- 48 h HOURLY forecast ----------------------------------------
     fc_hr = requests.get(
         HOURLY_FC,
         params=dict(lat=LAT, lon=LON, units="metric", appid=OWM_KEY),
@@ -200,29 +115,26 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
     wx_hr = (
         pd.DataFrame(fc_hr["list"])[:48]
-          .assign(
-              ts       = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True),
-              temp     = lambda d: d["main"].apply(lambda m: m["temp"]),
-              humidity = lambda d: d["main"].apply(lambda m: m["humidity"]),
-              clouds   = lambda d: d["clouds"].apply(lambda c: c["all"]),
-              sun_up   = lambda d: (
-                  d["sys"].apply(lambda s: 1 if s.get("pod", "n") == "d" else 0)
-                  if "sys" in d.columns
-                  else d["weather"].apply(
-                      lambda w: 1 if w[0]["icon"].endswith("d") else 0
-                  )
-              ),
-          )
-          .set_index("ts")[["temp", "humidity", "clouds", "sun_up"]]
+        .assign(
+            ts       = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True),
+            temp     = lambda d: d["main"].apply(lambda m: m["temp"]),
+            humidity = lambda d: d["main"].apply(lambda m: m["humidity"]),
+            clouds   = lambda d: d["clouds"].apply(lambda c: c["all"]),
+            sun_up   = lambda d: d["sys"].apply(
+                lambda s: 1 if s.get("pod", "n") == "d" else 0
+            ) if "sys" in d.columns else d["weather"].apply(
+                lambda w: 1 if w[0]["icon"].endswith("d") else 0
+            ),
+        )
+        .set_index("ts")[["temp", "humidity", "clouds", "sun_up"]]
     )
     wx_hr["cloud_bucket"] = wx_hr["clouds"].apply(_cloud_bucket)
-    wx_hr["sun_up"]       = wx_hr["sun_up"].fillna(0).astype(int)
 
-    # ── 30 d HOURLY HISTORY ────────────────────────────────────────────────
+    # ---------- 30-day HOURLY history ---------------------------------------
     hist_rows = []
     for back in range(1, HIST_DAYS + 1):
-        day = now - dt.timedelta(days=back)
-        start_ts = int(day.replace(hour=0, minute=0, second=0).timestamp())
+        day      = now - dt.timedelta(days=back)
+        start_ts = int(day.replace(hour=0,  minute=0, second=0).timestamp())
         end_ts   = int(day.replace(hour=23, minute=59, second=59).timestamp())
 
         r = requests.get(
@@ -234,7 +146,6 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         )
         for itm in r.json().get("list", []):
             clouds = itm["clouds"]["all"]
-            pod    = itm.get("sys", {}).get("pod")            # 'd' or 'n'
             hist_rows.append(
                 dict(
                     ts           = _dt_utc(itm["dt"]),
@@ -242,18 +153,18 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                     humidity     = itm["main"]["humidity"],
                     clouds       = clouds,
                     cloud_bucket = _cloud_bucket(clouds),
-                    sun_up       = 1 if pod == "d" else 0,
+                    sun_up       = 1 if itm.get("sys", {}).get("pod", "n") == "d" else 0,
                 )
             )
 
     wx_hist = (
         pd.DataFrame(hist_rows)
-          .set_index("ts")
-          .sort_index()
-          .drop_duplicates()
+        .set_index("ts")
+        .sort_index()
+        .drop_duplicates()
     )
 
-    # ── 16 d DAILY FORECAST ────────────────────────────────────────────────
+    # ---------- 16-day DAILY forecast (keep sunrise/sunset) -----------------
     fc_dl = requests.get(
         DAILY_FC,
         params=dict(lat=LAT, lon=LON, cnt=16, units="metric", appid=OWM_KEY),
@@ -262,15 +173,15 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
     wx_dl = (
         pd.DataFrame(fc_dl["list"])
-          .assign(
-              ts       = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True)
-                                   + pd.Timedelta(hours=12),
-              temp     = lambda d: d["temp"].apply(lambda t: t["max"]),
-              humidity = lambda d: d["humidity"],
-              clouds   = lambda d: d["clouds"],
-          )
-          .set_index("ts")[["temp", "humidity", "clouds", "sunrise", "sunset"]]
-          .sort_index()
+        .assign(
+            ts       = lambda d: pd.to_datetime(d["dt"], unit="s", utc=True)
+                                + pd.Timedelta(hours=12),
+            temp     = lambda d: d["temp"].apply(lambda t: t["max"]),
+            humidity = lambda d: d["humidity"],
+            clouds   = lambda d: d["clouds"],
+        )
+        .set_index("ts")[["temp", "humidity", "clouds", "sunrise", "sunset"]]
+        .sort_index()
     )
 
     return wx_hist, wx_hr, wx_dl
@@ -279,24 +190,10 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 # ── model ────────────────────────────────────────────────────────────────────
 # ── model ────────────────────────────────────────────────────────────────────
 from sklearn.linear_model import HuberRegressor
-from numpy import log1p, expm1, clip
-import numpy as np
-
-from sklearn.linear_model import HuberRegressor
-from numpy import log1p, expm1, clip
-import numpy as np
+from numpy import log1p, expm1, clip, zeros
 
 def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
-    """Return an object with .predict(df) that outputs kWh (negative = export)."""
-    # ---------- guarantee required weather columns -------------------------
-    for col in ("sun_up", "cloud_bucket"):
-        if col not in wx_hist.columns:
-            if col == "sun_up":
-                wx_hist[col] = 0
-            else:
-                wx_hist[col] = wx_hist["clouds"].apply(_cloud_bucket)
-
-    # ---------- merge solar + weather, fit robust model --------------------
+    """Return a robust production model; always returns an object with .predict(df)."""
     solar_hr = solar[solar["kwh"] != 0].reset_index()
     solar_hr["ts_hour"] = solar_hr["ts"].dt.floor("h")
 
@@ -317,12 +214,17 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
     merged = solar_hr.merge(wx_hist_agg, on="ts_hour", how="inner").dropna()
     merged["hour"] = merged["ts_hour"].dt.hour
     merged["doy"]  = merged["ts_hour"].dt.dayofyear
+    merged["irrad"]= 1.0 - merged["clouds"] / 100.0
 
     # daylight rows for capacity fit
     daylight = merged[merged["sun_up"] == 1].copy()
+
+    # -------- guard: if no daylight rows, use median fallback ---------------
     if daylight.empty:
-        med = (merged.groupby("hour")["kwh"].median()
-                        .reindex(range(24), fill_value=0.0).abs() * 1.10)
+        per_hour_median = (
+            merged.groupby("hour")["kwh"].median()
+                   .reindex(range(24), fill_value=0.0).abs() * 1.10
+        )
 
         class MedianModel:
             def __init__(self, med): self.med = med.values
@@ -330,140 +232,102 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
                 out = -self.med[X["hour"].to_numpy()] * (1 - X["clouds"]/100)
                 out[X["sun_up"] == 0] = 0.0
                 return out
-        return MedianModel(med)
 
-    daylight["irrad"]  = 1.0 - daylight["clouds"] / 100.0
+        return MedianModel(per_hour_median)
+
+    # -------- robust capacity fit ------------------------------------------
+    daylight["irrad"] = 1.0 - daylight["clouds"] / 100.0
     daylight["y_norm"] = daylight["kwh"].abs() / daylight["irrad"].clip(lower=0.1)
-    y_cap = np.log1p(daylight["y_norm"])
+    y = np.log1p(daylight["y_norm"])
     X_cap = daylight[["temp", "humidity", "clouds",
                       "cloud_bucket", "hour", "doy"]]
 
-    huber = HuberRegressor(max_iter=500, epsilon=1.5).fit(X_cap, y_cap)
+    huber = HuberRegressor(max_iter=500, epsilon=1.5).fit(X_cap, y)
 
-    hour_cap = (daylight.groupby("hour")["kwh"].quantile(0.95)
-                          .reindex(range(24), fill_value=0.0).abs().to_numpy())
+
+    # hourly physical cap (110 % of best in last 30 days)
+    
 
     class Wrapper:
         def __init__(self, core, cap):
             self.core = core
-            self.cap  = cap      # length-24 ndarray
+            self.cap  = cap        # length-24 numpy
 
         def predict(self, X_df):
             irrad = 1.0 - X_df["clouds"] / 100.0
             cap   = self.cap[X_df["hour"].to_numpy()]
             y_hat = expm1(self.core.predict(
-                          X_df[["temp","humidity","clouds",
-                                "cloud_bucket","hour","doy"]]))
-            pred  = -y_hat * irrad
-            pred  = clip(pred, -cap, 0)
+                          X_df[["temp","humidity","clouds","cloud_bucket","hour","doy"]]))
+            pred  = -y_hat * irrad       # negative = export
+            pred  = clip(pred, -cap, 0)  # never exceed cap
             pred[X_df["sun_up"] == 0] = 0.0
             return pred
 
     return Wrapper(huber, hour_cap)
-# ────────────────────────────────────────────────────────────────────────────
-def _predict_block(
-        df: pd.DataFrame,
-        model,
-        horizon: int,
-        *,
-        slope: float = 1.0,
-        intercept: float = 0.0,
-):
-    """
-    • Takes the first *horizon* rows of *df*.
-    • Ensures *all required columns* exist, creating safe defaults when missing.
-    • Runs model → kWh, applies (slope, intercept) post-correction.
-    • Returns [{"pred_mwh", "timestamp"}, …].
-    """
+
+
+# ── prediction helpers ───────────────────────────────────────────────────────
+def _predict_block(df: pd.DataFrame, model, horizon: int):
     blk = df.iloc[:horizon].copy()
-
-    # ---------- harden every expected column -------------------------------
-    defaults = {
-        "temp":         15.0,
-        "humidity":     70.0,
-        "clouds":       50.0,
-        "cloud_bucket": 2,
-        "sun_up":       0,
-    }
-    for col, default in defaults.items():
-        if col not in blk:
-            blk[col] = default
-
-    # cloud_bucket can be re-derived safely
-    blk["cloud_bucket"] = blk["clouds"].apply(_cloud_bucket)
-
-    # time features
-    blk.index = pd.to_datetime(blk.index, utc=True)
     blk["hour"] = blk.index.hour
     blk["doy"]  = blk.index.dayofyear
 
-    # ------------------ model → kWh ----------------------------------------
     X = blk[["temp", "humidity", "clouds",
-             "cloud_bucket", "hour", "doy", "sun_up"]]
-    if not np.isfinite(slope):     slope = 1.0
-    if not np.isfinite(intercept): intercept = 0.0
-    blk["pred_kwh"] = model.predict(X) * slope + intercept
-    if hasattr(model, "cap"):
-        cap_arr = model.cap[blk["hour"].to_numpy()]        # kWh limits (positive)
-        blk["pred_kwh"] = np.clip(blk["pred_kwh"], -cap_arr, 0.0)
-    # kWh → MWh for the API
-    blk["pred_mwh"] = blk["pred_kwh"] / 1_000.0
+             "cloud_bucket", "hour", "doy", "sun_up"]].ffill()
+
+    blk["pred_kwh"] = model.predict(X)
+
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
-
+    blk["pred_mwh"]  = blk["pred_kwh"] / 1000.0
     return blk[["pred_mwh", "timestamp"]].round(4).to_dict("records")
-# ────────────────────────────────────────────────────────────────────────────
 
-def make_forecasts(model,
-                   wx_hr: pd.DataFrame,
-                   wx_dl: pd.DataFrame,
-                   *,
-                   scale: float   = 1.0,
-                   slope: float   = 1.0,
-                   intercept: float = 0.0):
-    eff_slope = slope * scale    # merge both corrections
 
-    # ----- 24 × 1 h ---------------------------------------------------------
-    hourly = _predict_block(wx_hr, model, 24,
-                            slope=eff_slope, intercept=intercept)
 
-    # helper – expand one daily row into 24 synthetic hours
+def make_forecasts(model, wx_hr: pd.DataFrame, wx_dl: pd.DataFrame):
+    hourly = _predict_block(wx_hr, model, 24)
+
     def _expand_day(row_ts, row_vals):
-        base = row_ts.floor("D")
-        idx  = [base + pd.Timedelta(hours=h) for h in range(24)]
+        """Build a 24-hour synthetic frame for one daily forecast row."""
+        base       = row_ts.floor("D")
+        sunrise_s  = row_vals["sunrise"]
+        sunset_s   = row_vals["sunset"]
+        clouds_pct = row_vals["clouds"]
+        temp_val   = row_vals["temp"]
+        hum_val    = row_vals["humidity"]
+    
+        idx = [base + pd.Timedelta(hours=h) for h in range(24)]
+    
         return pd.DataFrame(
             {
-                "temp":         row_vals["temp"],
-                "humidity":     row_vals["humidity"],
-                "clouds":       row_vals["clouds"],
-                "cloud_bucket": _cloud_bucket(row_vals["clouds"]),
+                "temp":         temp_val,
+                "humidity":     hum_val,
+                "clouds":       clouds_pct,
+                "cloud_bucket": _cloud_bucket(clouds_pct),
                 "sun_up": [
-                    1 if row_vals["sunrise"] <= t.timestamp() <= row_vals["sunset"] else 0
+                    1 if sunrise_s <= t.timestamp() <= sunset_s else 0
                     for t in idx
                 ],
             },
             index=idx,
         )
 
-    # ----- 7-day horizon ----------------------------------------------------
-    daily = []
-    d0_ts  = pd.to_datetime(hourly[0]["timestamp"], unit="s", utc=True).floor("D")
-    d0_val = round(sum(pt["pred_mwh"] for pt in hourly), 4)
-    daily.append({"pred_mwh": d0_val, "timestamp": int(d0_ts.timestamp())})
+    daily_records = []
+    day0_ts = pd.to_datetime(hourly[0]["timestamp"], unit="s", utc=True).floor("D")
+    day0_val = round(sum(pt["pred_mwh"] for pt in hourly), 4)
+    daily_records.append({"pred_mwh": day0_val, "timestamp": int(day0_ts.timestamp())})
 
-    for ts, row in wx_dl.iloc[1:8].iterrows():          # next 7 days
-        synth = _expand_day(ts, row)
-        block = _predict_block(synth, model, 24,
-                               slope=eff_slope, intercept=intercept)
-        daily.append({
-            "pred_mwh": round(sum(pt["pred_mwh"] for pt in block), 4),
-            "timestamp": int(ts.floor("D").timestamp())
-        })
+    for ts, row in wx_dl.iloc[1:8].iterrows():  # Only 7 days instead of 16
+        synth_df = _expand_day(ts, row)
+        block = _predict_block(synth_df, model, 24)
+        day_val = round(sum(pt["pred_mwh"] for pt in block), 4)
+        daily_records.append(
+            {"pred_mwh": day_val, "timestamp": int(ts.floor("D").timestamp())}
+        )
 
-    return hourly, daily
+    return hourly, daily_records  # ← Only return these
 
 
-
-
+# ── Flask endpoint ───────────────────────────────────────────────────────────
 @app.route("/forecast")
 def forecast():
     now = time.time()
@@ -471,17 +335,10 @@ def forecast():
         return jsonify(_cache["payload"])
 
     try:
-        solar                 = get_solar_history()
+        solar = get_solar_history()
         wx_hist, wx_hr, wx_dl = get_weather()
-
-        model  = train_model(solar, wx_hist)
-        scale  = _calibrate_scale(model, solar, wx_hist)
-        slope, intercept = _calibrate_level(model, solar, wx_hist)
-
-        hourly, daily_7 = make_forecasts(
-            model, wx_hr, wx_dl,
-            scale=scale, slope=slope, intercept=intercept
-        )
+        model = train_model(solar, wx_hist)
+        hourly, daily_7 = make_forecasts(model, wx_hr, wx_dl)
 
         payload = {
             "generated_utc": int(now),
@@ -493,11 +350,8 @@ def forecast():
 
     except Exception as exc:
         return Response(
-            json.dumps({"error": str(exc)}), status=500,
-            mimetype="application/json"
+            json.dumps({"error": str(exc)}), status=500, mimetype="application/json"
         )
-
-
 
 if __name__ == "__main__":
     print("→  http://localhost:8000/forecast")
