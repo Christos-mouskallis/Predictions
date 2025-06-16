@@ -393,7 +393,9 @@ def _predict_block(
     X = blk[["temp", "humidity", "clouds",
              "cloud_bucket", "hour", "doy", "sun_up"]]
     blk["pred_kwh"] = model.predict(X) * slope + intercept
-
+    if hasattr(model, "cap"):
+        cap_arr = model.cap[blk["hour"].to_numpy()]        # kWh limits (positive)
+        blk["pred_kwh"] = np.clip(blk["pred_kwh"], -cap_arr, 0.0)
     # kWh → MWh for the API
     blk["pred_mwh"] = blk["pred_kwh"] / 1_000.0
     blk["timestamp"] = (blk.index.view("int64") // 1_000_000_000).astype(int)
