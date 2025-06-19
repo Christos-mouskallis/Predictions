@@ -84,7 +84,7 @@ def get_solar_history(days: int = HIST_DAYS) -> pd.DataFrame:
       .assign(
         ts  = lambda d: _dt_utc(d["ts"]),
 
-        kwh = lambda d: pd.to_numeric(d["kwh"], errors="coerce") / 1000.0,
+        kwh = lambda d: pd.to_numeric(d["kwh"], errors="coerce"),
         )
       .dropna(subset=["ts", "kwh"])
       .set_index("ts")
@@ -244,9 +244,9 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
 
     huber = HuberRegressor(max_iter=500, epsilon=1.5).fit(X_cap, y)
 
-
-    # hourly physical cap (110 % of best in last 30 days)
-    
+    hour_cap = (daylight.groupby("hour")["kwh"].quantile(0.95)
+                          .reindex(range(24), fill_value=0.0)
+                          .abs().to_numpy() * 1.10)
 
     class Wrapper:
         def __init__(self, core, cap):
