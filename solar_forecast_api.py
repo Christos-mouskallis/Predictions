@@ -27,7 +27,7 @@ SOLAR_URL  = (
 )
 
 # OpenWeather – Developer plan
-OWM_KEY   = os.getenv("67d4dbfce7083e9195b41a0f4dafba74")
+OWM_KEY = os.getenv("OWM_KEY", "67d4dbfce7083e9195b41a0f4dafba74")
 HIST_URL  = "https://history.openweathermap.org/data/2.5/history/city"
 HOURLY_FC = "https://pro.openweathermap.org/data/2.5/forecast/hourly"
 DAILY_FC  = "https://api.openweathermap.org/data/2.5/forecast/daily"
