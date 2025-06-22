@@ -490,7 +490,7 @@ def _predict_block(df: pd.DataFrame, model, horizon: int):
     # Make predictions
     try:
         predictions = model.predict(blk)
-        blk["pred_kwh"] = predictions * 0.7
+        blk["pred_kwh"] = predictions * 0.4
     except Exception as e:
         print(f"Prediction error: {e}")
         blk["pred_kwh"] = 0.0
