@@ -276,7 +276,6 @@ def get_weather() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         
     except Exception as e:
         print(f"Error getting weather data: {e}")
-        # Return empty dataframes with correct structure
         empty_wx = pd.DataFrame(columns=["temp", "humidity", "clouds", "cloud_bucket", "sun_up"])
         empty_daily = pd.DataFrame(columns=["temp", "humidity", "clouds", "sunrise", "sunset"])
         return empty_wx, empty_wx, empty_daily
@@ -292,18 +291,15 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
         print(" Insufficient data for training, using fallback model")
         return create_fallback_model()
 
-    # Prepare solar data - now includes all generation data (originally negative values)
     solar_hr = solar.reset_index()
     solar_hr["ts_hour"] = solar_hr["ts"].dt.floor("h")
-    
-    # Filter for meaningful generation (>0.001 kWh to avoid noise)
+
     meaningful_gen = solar_hr[solar_hr["kwh"] > 0.001]
     
     print(f" Total solar records: {len(solar_hr)}")
     print(f" Meaningful generation records: {len(meaningful_gen)}")
     print(f" Generation stats: min={solar_hr['kwh'].min():.4f}, max={solar_hr['kwh'].max():.4f}, mean={meaningful_gen['kwh'].mean():.4f}")
 
-    # Use all solar data for training (not just positive)
     solar_for_training = solar_hr.copy()
 
     # Aggregate weather data by hour
@@ -332,24 +328,20 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
         print(" No merged data available")
         return create_fallback_model()
         
-    # Add time features
     merged["hour"] = merged["ts_hour"].dt.hour
     merged["doy"] = merged["ts_hour"].dt.dayofyear
     merged["month"] = merged["ts_hour"].dt.month
-    merged["irrad"] = (100 - merged["clouds"]) / 100.0  # Solar irradiance proxy
+    merged["irrad"] = (100 - merged["clouds"]) / 100.0
 
     print(f" Merged training data: {len(merged)} rows")
     print(f"Hour distribution:\n{merged['hour'].value_counts().sort_index()}")
 
-    # For training, focus on periods with potential for generation
-    # Include all data but weight daylight hours more heavily
     training_data = merged.copy()
-    
-    # Create daylight subset for validation
+
     daylight = merged[
         (merged["sun_up"] == 1) | 
         (merged["hour"].between(6, 18)) |
-        (merged["kwh"] > 0.001)  # Any meaningful generation
+        (merged["kwh"] > 0.001)
     ].copy()
 
     print(f" Daylight training subset: {len(daylight)} rows")
@@ -375,15 +367,13 @@ def train_model(solar: pd.DataFrame, wx_hist: pd.DataFrame):
         )
         model.fit(X, y)
         
-        # Calculate hourly capacity using daylight data for realistic limits
         if len(daylight) > 0:
             hour_capacity = (
                 daylight.groupby("hour")["kwh"]
                 .quantile(0.95)
                 .reindex(range(24), fill_value=0.0)
-            ) * 1.3  # Add 30% buffer for peak conditions
+            ) * 1.3
         else:
-            # Fallback capacity calculation using all data
             hour_capacity = (
                 training_data.groupby("hour")["kwh"]
                 .quantile(0.95)
@@ -416,10 +406,10 @@ def create_fallback_model():
     
     # Typical solar generation pattern (normalized)
     solar_pattern = np.array([
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # 0-5: night
-        0.01, 0.05, 0.15, 0.35, 0.60, 0.80,  # 6-11: morning
-        0.95, 1.0, 0.95, 0.85, 0.65, 0.40,   # 12-17: peak & afternoon
-        0.20, 0.05, 0.01, 0.0, 0.0, 0.0      # 18-23: evening & night
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.01, 0.05, 0.15, 0.35, 0.60, 0.80,
+        0.95, 1.0, 0.95, 0.85, 0.65, 0.40, 
+        0.20, 0.05, 0.01, 0.0, 0.0, 0.0     
     ])
     
     # Assume 3kW peak system (typical residential)
